@@ -77,7 +77,7 @@ export class KokoroBackend {
           if (m.fellBackFrom) {
             console.warn(`Kokoro fell back from ${m.fellBackFrom} to wasm: ${m.reason}`);
           }
-          console.info(`Kokoro voice model ready on ${loadedDevice}`);
+          console.info(`Kokoro voice model ready on ${loadedDevice} (${m.dtype})`);
           resolve();
         } else if (m.type === "error") {
           worker.removeEventListener("message", onMsg);

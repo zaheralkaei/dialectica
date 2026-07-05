@@ -26,13 +26,23 @@ let genChain = Promise.resolve();
 
 // Load the model on a specific backend AND prove the full inference path works
 // by running a tiny warm-up synth. Weights loading succeeding is not enough —
-// a backend (e.g. WebGPU with an unsupported op/dtype) can load fine yet throw
-// at generate() time. Validating here lets the caller safely fall back. The
-// warm-up also pays onnxruntime's one-time cold-start cost off the critical
-// path, so the first real segment of the debate isn't the slow one.
-async function loadOn(device, dtype) {
+// a backend can load fine yet throw at generate() time. Validating here lets
+// the caller safely fall back. The warm-up also pays onnxruntime's one-time
+// cold-start cost off the critical path, so the first real segment isn't slow.
+//
+// dtype is chosen per backend and this matters a lot: quantized weights (q8) on
+// WebGPU load and run WITHOUT error but produce garbled/nonsense audio, so on
+// WebGPU we use full-precision fp32. WASM handles q8 correctly and it keeps the
+// download small. Note the warm-up can't catch the garbled-audio case (it only
+// checks that generate() doesn't throw), which is exactly why the dtype has to
+// be right up front.
+function dtypeFor(device) {
+  return device === "webgpu" ? "fp32" : "q8";
+}
+
+async function loadOn(device) {
   const t = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
-    dtype,
+    dtype: dtypeFor(device),
     device,
     progress_callback: (p) => self.postMessage({ type: "progress", p }),
   });
@@ -44,21 +54,21 @@ self.onmessage = async (e) => {
   const msg = e.data;
 
   if (msg.type === "load") {
-    const dtype = msg.dtype || "q8";
     const preferred = msg.device || "wasm";
     // Prefer the fast backend (usually WebGPU). If it fails to load OR fails the
     // warm-up inference, fall back to WASM, which works everywhere. WASM is
     // slower but reliable — better a slow voice than none.
     try {
-      tts = await loadOn(preferred, dtype);
-      self.postMessage({ type: "ready", device: preferred });
+      tts = await loadOn(preferred);
+      self.postMessage({ type: "ready", device: preferred, dtype: dtypeFor(preferred) });
     } catch (err1) {
       if (preferred !== "wasm") {
         try {
-          tts = await loadOn("wasm", dtype);
+          tts = await loadOn("wasm");
           self.postMessage({
             type: "ready",
             device: "wasm",
+            dtype: dtypeFor("wasm"),
             fellBackFrom: preferred,
             reason: String(err1?.message || err1),
           });
