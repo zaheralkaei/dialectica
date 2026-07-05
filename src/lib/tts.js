@@ -1,40 +1,39 @@
-// Streaming Kokoro TTS, run in a Web Worker.
+// Streaming TTS, run in a Web Worker.
 //
 // Two-phase design. It lets us PREPARE a debater's turn — run the LLM and
 // synthesize the audio — while the *previous* debater is still speaking, then
 // PLAY it on cue with the text revealed in sync:
 //
-//   const prep = backend.prepareTurn(voice);
+//   const prep = backend.prepareTurn({ voice });
 //   prep.push(deltaText);        // feed streaming LLM tokens; synthesis starts NOW
 //   prep.finishInput();          // no more text coming
 //   await prep.play(onReveal);   // play buffered audio; reveal text sentence-by-sentence
 //   prep.cancel();
 //
-// Synthesis runs off the main thread in kokoroWorker.js — kokoro-js runs
-// onnxruntime WASM, which would freeze the UI (and stall the LLM token stream)
-// if run on the main thread. The main thread only schedules the returned PCM.
+// Synthesis runs off the main thread in piperWorker.js — onnxruntime WASM would
+// freeze the UI (and stall the LLM token stream) if run on the main thread. The
+// main thread only schedules the returned PCM. The engine (Piper) is behind the
+// worker's simple {load,gen}->{ready,audio} protocol, so nothing here is
+// engine-specific and it can be swapped without touching this file.
 
 const SENTENCE_RE = /[^.!?…\n]+[.!?…]+["'”’)]*|\n+/g;
 
 // We don't synthesize one sentence at a time — we group whole sentences into a
 // segment until it reaches this many characters, then send the segment to the
-// worker as a single generate() call. Longer segments give Kokoro more context
-// for natural prosody; the first one costs a bit more latency, but while it
-// plays the next segments finish generating, so the pipeline hides that cost.
+// worker as a single generate() call. Longer segments give the model more
+// context for natural prosody; the first one costs a bit more latency, but while
+// it plays the next segments finish generating, so the pipeline hides that cost.
 // Tune this to trade first-audio latency (lower) vs. prosody/fewer seams (higher).
 const MIN_SEGMENT_CHARS = 240;
 
 // Safety net: if the worker never returns a segment (crash, unexpected state),
-// give up on it after this long so a single segment can't stall the debate.
-// Generous because Kokoro runs single-threaded (see vite.config.js) — the first
-// segment also pays voice-load + WASM warm-up, so it can take 10s+ on a modest
-// machine. Too tight a timeout here is itself a cause of silent playback.
+// give up on it after this long so a single segment can't stall the debate. A
+// timed-out segment resolves null and is simply skipped in playback.
 const SYNTH_TIMEOUT_MS = 90000;
 
-export class KokoroBackend {
-  constructor(worker, ctx = null, device = "wasm") {
+export class TTSBackend {
+  constructor(worker, ctx = null) {
     this.worker = worker;
-    this.device = device; // which backend actually loaded ("webgpu" | "wasm")
     // The AudioContext may be created (and resumed) by the caller inside the
     // user-gesture handler and passed in — browsers only let audio start after
     // a user activation, and by the time the first turn is synthesized we're
@@ -52,32 +51,29 @@ export class KokoroBackend {
       // A failed segment resolves null (skipped in playback) rather than
       // rejecting, so one bad segment can't abort the turn.
       if (m.error) {
-        console.warn(`Kokoro synth error for segment ${m.id}: ${m.error}`);
+        console.warn(`TTS synth error for segment ${m.id}: ${m.error}`);
         p.resolve(null);
       } else {
         // Timing is logged so a slow backend is diagnosable from the console.
-        console.debug(`Kokoro segment ${m.id} synthesized in ${m.ms}ms on ${this.device}`);
+        console.debug(`TTS segment ${m.id} synthesized in ${m.ms}ms`);
         p.resolve(m); // { audio, sampling_rate, ms }
       }
     });
   }
 
-  static async load({ dtype = "q8", device = "wasm", onProgress, audioCtx = null } = {}) {
-    const worker = new Worker(new URL("./kokoroWorker.js", import.meta.url), {
+  // `voices` are pre-downloaded and the pipeline warmed up during load so the
+  // debate's first segment isn't cold.
+  static async load({ voices = [], onProgress, audioCtx = null } = {}) {
+    const worker = new Worker(new URL("./piperWorker.js", import.meta.url), {
       type: "module",
     });
-    let loadedDevice = device;
     await new Promise((resolve, reject) => {
       const onMsg = (e) => {
         const m = e.data;
         if (m.type === "progress") onProgress?.(m.p);
         else if (m.type === "ready") {
           worker.removeEventListener("message", onMsg);
-          loadedDevice = m.device || device;
-          if (m.fellBackFrom) {
-            console.warn(`Kokoro fell back from ${m.fellBackFrom} to wasm: ${m.reason}`);
-          }
-          console.info(`Kokoro voice model ready on ${loadedDevice} (${m.dtype})`);
+          console.info("TTS voices ready (Piper)");
           resolve();
         } else if (m.type === "error") {
           worker.removeEventListener("message", onMsg);
@@ -85,9 +81,9 @@ export class KokoroBackend {
         }
       };
       worker.addEventListener("message", onMsg);
-      worker.postMessage({ type: "load", dtype, device });
+      worker.postMessage({ type: "load", voices });
     });
-    return new KokoroBackend(worker, audioCtx, loadedDevice);
+    return new TTSBackend(worker, audioCtx);
   }
 
   _audioCtx() {
@@ -122,8 +118,8 @@ export class KokoroBackend {
     });
   }
 
-  prepareTurn({ kokoroVoice = "af_heart" }) {
-    return new KokoroPreparedTurn(this, kokoroVoice);
+  prepareTurn({ voice }) {
+    return new PreparedTurn(this, voice);
   }
 
   cancel() {
@@ -150,7 +146,7 @@ export class KokoroBackend {
 // One debater's turn. Text pushed in during LLM generation is chunked into
 // sentences and synthesized immediately (in the worker) — so audio is being
 // produced WHILE the LLM is still writing. play() is called later, on cue.
-class KokoroPreparedTurn {
+class PreparedTurn {
   constructor(backend, voice) {
     this.backend = backend;
     this.voice = voice;

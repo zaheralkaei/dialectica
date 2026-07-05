@@ -8,7 +8,7 @@ export default function DebaterCard({
   character,
   onChange,
   presets,
-  kokoroVoices,
+  voices,
   active,
   disabled,
 }) {
@@ -76,10 +76,10 @@ export default function DebaterCard({
         <span>Voice</span>
         <select
           disabled={disabled}
-          value={character.kokoroVoice}
-          onChange={(e) => set({ kokoroVoice: e.target.value })}
+          value={character.voice}
+          onChange={(e) => set({ voice: e.target.value })}
         >
-          {kokoroVoices.map((v) => (
+          {voices.map((v) => (
             <option key={v.id} value={v.id}>
               {v.label}
             </option>

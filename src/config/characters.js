@@ -1,18 +1,20 @@
-// Preset debater personas. Each has a persona prompt and a Kokoro voice id.
+// Preset debater personas. Each has a persona prompt and a Piper voice id.
 
-export const KOKORO_VOICES = [
-  { id: "af_heart", label: "Heart (US female, warm)" },
-  { id: "af_bella", label: "Bella (US female, bright)" },
-  { id: "af_nicole", label: "Nicole (US female, soft)" },
-  { id: "af_sarah", label: "Sarah (US female, calm)" },
-  { id: "bf_emma", label: "Emma (UK female, crisp)" },
-  { id: "bf_isabella", label: "Isabella (UK female)" },
-  { id: "am_michael", label: "Michael (US male, steady)" },
-  { id: "am_adam", label: "Adam (US male, punchy)" },
-  { id: "am_fenrir", label: "Fenrir (US male, deep)" },
-  { id: "bm_george", label: "George (UK male, measured)" },
-  { id: "bm_fable", label: "Fable (UK male, storyteller)" },
-  { id: "bm_lewis", label: "Lewis (UK male)" },
+// Piper (VITS) voices, from the diffusionstudio/piper-voices set. Each is a
+// separate ~20–60 MB download fetched + cached (OPFS) on first use.
+export const VOICES = [
+  { id: "en_US-hfc_female-medium", label: "Heather (US female, warm)" },
+  { id: "en_US-amy-medium", label: "Amy (US female, bright)" },
+  { id: "en_US-lessac-medium", label: "Lessac (US female, clear)" },
+  { id: "en_US-kristin-medium", label: "Kristin (US female, soft)" },
+  { id: "en_GB-jenny_dioco-medium", label: "Jenny (UK female, crisp)" },
+  { id: "en_GB-alba-medium", label: "Alba (UK female)" },
+  { id: "en_US-hfc_male-medium", label: "Harrison (US male, steady)" },
+  { id: "en_US-ryan-high", label: "Ryan (US male, punchy)" },
+  { id: "en_US-joe-medium", label: "Joe (US male, deep)" },
+  { id: "en_GB-alan-medium", label: "Alan (UK male, measured)" },
+  { id: "en_GB-northern_english_male-medium", label: "Cedric (UK male, storyteller)" },
+  { id: "en_US-libritts_r-medium", label: "Miles (US male, expressive)" },
 ];
 
 export const PRESET_CHARACTERS = [
@@ -23,7 +25,7 @@ export const PRESET_CHARACTERS = [
     color: "#8b7fd6",
     persona:
       "You are a measured, Socratic thinker. You reason from first principles and ethics, question hidden assumptions, and prize intellectual honesty over scoring points. Calm but incisive.",
-    kokoroVoice: "bm_george",
+    voice: "en_GB-alan-medium",
   },
   {
     id: "firebrand",
@@ -32,7 +34,7 @@ export const PRESET_CHARACTERS = [
     color: "#e0585b",
     persona:
       "You are a passionate contrarian. You attack weak reasoning head-on, use vivid rhetoric, and are unafraid to be provocative. Energetic, blunt, a little theatrical — but never cruel.",
-    kokoroVoice: "am_adam",
+    voice: "en_US-ryan-high",
   },
   {
     id: "pragmatist",
@@ -41,7 +43,7 @@ export const PRESET_CHARACTERS = [
     color: "#4f9d8c",
     persona:
       "You are a no-nonsense pragmatist. You care about costs, trade-offs, and what actually works in the real world. You cut through idealism with concrete examples and numbers.",
-    kokoroVoice: "am_michael",
+    voice: "en_US-hfc_male-medium",
   },
   {
     id: "optimist",
@@ -50,7 +52,7 @@ export const PRESET_CHARACTERS = [
     color: "#5aa9e6",
     persona:
       "You are a hopeful futurist. You highlight opportunity, human ingenuity, and progress. Warm and encouraging, you reframe problems as solvable challenges.",
-    kokoroVoice: "af_heart",
+    voice: "en_US-hfc_female-medium",
   },
   {
     id: "scientist",
@@ -59,7 +61,7 @@ export const PRESET_CHARACTERS = [
     color: "#6c7ae0",
     persona:
       "You are a rigorous empiricist. You demand evidence, cite studies and mechanisms, flag uncertainty, and are deeply skeptical of claims that outrun the data. Precise and dry-witted.",
-    kokoroVoice: "bf_emma",
+    voice: "en_GB-jenny_dioco-medium",
   },
   {
     id: "poet",
@@ -68,7 +70,7 @@ export const PRESET_CHARACTERS = [
     color: "#d98cc4",
     persona:
       "You are a lyrical romantic. You argue through metaphor, story, and emotional truth. You find the human heart of every abstract question and make it vivid.",
-    kokoroVoice: "af_bella",
+    voice: "en_US-amy-medium",
   },
 ];
 

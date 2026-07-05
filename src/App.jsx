@@ -1,8 +1,8 @@
 import { useRef, useState, useCallback } from "react";
 import { MODELS, DEFAULT_MODEL, getEngine, streamTurn, isWebGPUAvailable } from "./lib/llm.js";
 import { buildTurnPrompt } from "./lib/debate.js";
-import { KokoroBackend } from "./lib/tts.js";
-import { PRESET_CHARACTERS, KOKORO_VOICES, makeCharacter } from "./config/characters.js";
+import { TTSBackend } from "./lib/tts.js";
+import { PRESET_CHARACTERS, VOICES, makeCharacter } from "./config/characters.js";
 import { PRESET_TOPICS, randomTopic } from "./config/topics.js";
 import DebaterCard from "./components/DebaterCard.jsx";
 import Transcript from "./components/Transcript.jsx";
@@ -48,21 +48,17 @@ export default function App() {
   }, []);
 
   async function ensureTTS() {
-    setStatus("Loading Kokoro voice model…");
-    // Kokoro runs on WASM, NOT WebGPU — on purpose. WebLLM already fills the GPU
-    // with the debate model (~2 GB for the 3B); adding Kokoro's weights on top
-    // exhausts VRAM and the WebGPU device gets *lost*, which crashes the LLM
-    // mid-debate. WASM keeps synthesis on the CPU so the GPU stays exclusively
-    // for the LLM. Speed comes from multi-threading instead: the cross-origin
-    // isolation headers (see vite.config.js / netlify.toml) enable
-    // SharedArrayBuffer, so onnxruntime scales Kokoro across CPU threads.
-    return KokoroBackend.load({
-      device: "wasm",
-      dtype: "q8",
+    setStatus("Loading Piper voices…");
+    // Piper (VITS) is a much lighter neural TTS than Kokoro — it runs on the CPU
+    // (multi-threaded onnxruntime via the cross-origin isolation headers), so the
+    // GPU stays entirely with WebLLM. We pre-download just the two debaters'
+    // voices so nothing stalls mid-debate fetching a model.
+    return TTSBackend.load({
+      voices: [charA.voice, charB.voice],
       audioCtx: audioCtxRef.current,
       onProgress: (p) => {
         if (p?.progress != null) setProgress(Math.round(p.progress));
-        if (p?.status) setStatus(`Kokoro: ${p.file || p.status} ${p.progress ? Math.round(p.progress) + "%" : ""}`);
+        if (p?.status) setStatus(`Piper: ${p.file || p.status} ${p.progress ? Math.round(p.progress) + "%" : ""}`);
       },
     });
   }
@@ -148,7 +144,7 @@ export default function App() {
         isOpening: turnIndex < 2,
       });
 
-      const prep = tts.prepareTurn({ kokoroVoice: character.kokoroVoice });
+      const prep = tts.prepareTurn({ voice: character.voice });
       prefetchRef.current = prep;
 
       let text = "";
@@ -254,7 +250,7 @@ export default function App() {
           character={charA}
           onChange={setCharA}
           presets={PRESET_CHARACTERS}
-          kokoroVoices={KOKORO_VOICES}
+          voices={VOICES}
           active={activeSpeaker === "A"}
           disabled={busy}
         />
@@ -267,7 +263,7 @@ export default function App() {
           character={charB}
           onChange={setCharB}
           presets={PRESET_CHARACTERS}
-          kokoroVoices={KOKORO_VOICES}
+          voices={VOICES}
           active={activeSpeaker === "B"}
           disabled={busy}
         />
