@@ -14,6 +14,16 @@ import { KokoroTTS } from "kokoro-js";
 
 let tts = null;
 
+// A single onnxruntime InferenceSession is NOT safe to call concurrently: two
+// overlapping tts.generate() runs contend on the same session and (depending on
+// backend/build) either roughly double each other's latency or wedge until the
+// caller times out. And overlap absolutely happens here — a turn's first
+// segment is submitted mid-stream and its second at end-of-stream, well within
+// the ~10s a single-threaded synth takes. So we funnel every gen through a
+// promise chain: exactly one inference at a time, each returning at full speed
+// the moment it finishes (segment 1 doesn't have to wait behind segment 2).
+let genChain = Promise.resolve();
+
 self.onmessage = async (e) => {
   const msg = e.data;
 
@@ -35,16 +45,20 @@ self.onmessage = async (e) => {
   }
 
   if (msg.type === "gen") {
-    try {
-      const audio = await tts.generate(msg.text, { voice: msg.voice });
-      const pcm = audio.audio; // Float32Array
-      // Transfer the underlying buffer to avoid a copy.
-      self.postMessage(
-        { type: "audio", id: msg.id, audio: pcm, sampling_rate: audio.sampling_rate },
-        [pcm.buffer]
-      );
-    } catch (err) {
-      self.postMessage({ type: "audio", id: msg.id, error: String(err?.message || err) });
-    }
+    // Chain onto the previous generate so runs never overlap. The catch keeps
+    // one failed segment from breaking the chain for everything after it.
+    genChain = genChain.then(async () => {
+      try {
+        const audio = await tts.generate(msg.text, { voice: msg.voice });
+        const pcm = audio.audio; // Float32Array
+        // Transfer the underlying buffer to avoid a copy.
+        self.postMessage(
+          { type: "audio", id: msg.id, audio: pcm, sampling_rate: audio.sampling_rate },
+          [pcm.buffer]
+        );
+      } catch (err) {
+        self.postMessage({ type: "audio", id: msg.id, error: String(err?.message || err) });
+      }
+    });
   }
 };
