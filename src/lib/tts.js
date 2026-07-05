@@ -29,9 +29,14 @@ const MIN_SEGMENT_CHARS = 240;
 const SYNTH_TIMEOUT_MS = 30000;
 
 export class KokoroBackend {
-  constructor(worker) {
+  constructor(worker, ctx = null) {
     this.worker = worker;
-    this.ctx = null;
+    // The AudioContext may be created (and resumed) by the caller inside the
+    // user-gesture handler and passed in — browsers only let audio start after
+    // a user activation, and by the time the first turn is synthesized we're
+    // long past the click. If none is provided we lazily create our own.
+    this.ctx = ctx;
+    this.ownsCtx = !ctx;
     this.reqId = 0;
     this.pending = new Map(); // request id -> { resolve }
     this.worker.addEventListener("message", (e) => {
@@ -51,7 +56,7 @@ export class KokoroBackend {
     });
   }
 
-  static async load({ dtype = "q8", device = "wasm", onProgress } = {}) {
+  static async load({ dtype = "q8", device = "wasm", onProgress, audioCtx = null } = {}) {
     const worker = new Worker(new URL("./kokoroWorker.js", import.meta.url), {
       type: "module",
     });
@@ -70,11 +75,14 @@ export class KokoroBackend {
       worker.addEventListener("message", onMsg);
       worker.postMessage({ type: "load", dtype, device });
     });
-    return new KokoroBackend(worker);
+    return new KokoroBackend(worker, audioCtx);
   }
 
   _audioCtx() {
-    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.ownsCtx = true;
+    }
     if (this.ctx.state === "suspended") this.ctx.resume();
     return this.ctx;
   }
@@ -107,7 +115,11 @@ export class KokoroBackend {
   }
 
   cancel() {
-    if (this.ctx) {
+    // Only tear down a context we created ourselves. A caller-provided context
+    // is reused across debates, so closing it here would silence every run
+    // after the first — in-flight audio is already stopped via each prepared
+    // turn's own cancel().
+    if (this.ctx && this.ownsCtx) {
       try {
         this.ctx.close();
       } catch {}

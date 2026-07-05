@@ -29,6 +29,7 @@ export default function App() {
 
   const runningRef = useRef(false);
   const ttsRef = useRef(null);
+  const audioCtxRef = useRef(null);
   const sessionRef = useRef(null); // the turn currently PLAYING
   const prefetchRef = useRef(null); // the next turn being PREPARED silently
   const engineRef = useRef(null);
@@ -56,6 +57,7 @@ export default function App() {
     return KokoroBackend.load({
       device: "wasm",
       dtype: "q8",
+      audioCtx: audioCtxRef.current,
       onProgress: (p) => {
         if (p?.progress != null) setProgress(Math.round(p.progress));
         if (p?.status) setStatus(`Kokoro: ${p.file || p.status} ${p.progress ? Math.round(p.progress) + "%" : ""}`);
@@ -69,6 +71,18 @@ export default function App() {
     if (debateActive) return;
     debateActive = true;
     runningRef.current = true;
+
+    // Unlock audio NOW, synchronously inside the click handler. Browsers only
+    // let an AudioContext produce sound after a user gesture; if we waited until
+    // the first turn is synthesized (many seconds later, after model downloads)
+    // the gesture is long gone and playback stays silent. Creating + resuming it
+    // here — still within the click — guarantees it's running when audio starts.
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtxRef.current.state === "suspended") audioCtxRef.current.resume();
+    } catch {}
 
     setError("");
     if (!webgpu) {
