@@ -16,6 +16,8 @@
 // worker's simple {load,gen}->{ready,audio} protocol, so nothing here is
 // engine-specific and it can be swapped without touching this file.
 
+import { log } from "./logger.js";
+
 const SENTENCE_RE = /[^.!?…\n]+[.!?…]+["'”’)]*|\n+/g;
 
 // We don't synthesize one sentence at a time — we group whole sentences into a
@@ -51,11 +53,9 @@ export class TTSBackend {
       // A failed segment resolves null (skipped in playback) rather than
       // rejecting, so one bad segment can't abort the turn.
       if (m.error) {
-        console.warn(`TTS synth error for segment ${m.id}: ${m.error}`);
-        p.resolve(null);
+        log("WARN", `synth error for request ${m.id}: ${m.error}`);
+        p.resolve(m); // carries { error } — the prepared turn logs it with context
       } else {
-        // Timing is logged so a slow backend is diagnosable from the console.
-        console.debug(`TTS segment ${m.id} synthesized in ${m.ms}ms`);
         p.resolve(m); // { audio, sampling_rate, ms }
       }
     });
@@ -73,7 +73,7 @@ export class TTSBackend {
         if (m.type === "progress") onProgress?.(m.p);
         else if (m.type === "ready") {
           worker.removeEventListener("message", onMsg);
-          console.info("TTS voices ready (Piper)");
+          log("TTS", "Piper voices ready");
           resolve();
         } else if (m.type === "error") {
           worker.removeEventListener("message", onMsg);
@@ -104,7 +104,7 @@ export class TTSBackend {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         if (this.pending.delete(id)) {
-          console.warn(`Kokoro synth timed out for segment ${id}`);
+          log("WARN", `synth request ${id} timed out after ${SYNTH_TIMEOUT_MS / 1000}s`);
           resolve(null);
         }
       }, SYNTH_TIMEOUT_MS);
@@ -118,8 +118,8 @@ export class TTSBackend {
     });
   }
 
-  prepareTurn({ voice }) {
-    return new PreparedTurn(this, voice);
+  prepareTurn({ voice, label = "turn" }) {
+    return new PreparedTurn(this, voice, label);
   }
 
   cancel() {
@@ -147,9 +147,10 @@ export class TTSBackend {
 // sentences and synthesized immediately (in the worker) — so audio is being
 // produced WHILE the LLM is still writing. play() is called later, on cue.
 class PreparedTurn {
-  constructor(backend, voice) {
+  constructor(backend, voice, label = "turn") {
     this.backend = backend;
     this.voice = voice;
+    this.label = label; // e.g. "Turn 1 (A)" — used to tag console logs
     this.ctx = backend._audioCtx();
     this.buffer = ""; // raw incoming text not yet split into sentences
     this.segment = ""; // completed sentences accumulating toward one segment
@@ -165,8 +166,15 @@ class PreparedTurn {
   _submit(segment) {
     const clean = segment.trim();
     if (!clean || this.canceled) return;
-    this.sentences.push(clean);
-    this.chunks.push(this.backend.synth(clean, this.voice)); // synthesis starts now
+    const n = this.sentences.push(clean); // segment number (1-based)
+    log("TTS", `${this.label}: synthesizing seg ${n} (${clean.length} chars)…`);
+    const p = this.backend.synth(clean, this.voice); // synthesis starts now
+    p.then((res) => {
+      if (this.canceled) return;
+      if (res?.audio) log("TTS", `${this.label}: seg ${n} done in ${res.ms}ms`);
+      else log("WARN", `${this.label}: seg ${n} produced no audio (skipped)`);
+    });
+    this.chunks.push(p);
   }
 
   // Accumulate a completed sentence into the current segment; flush to the
@@ -207,6 +215,7 @@ class PreparedTurn {
       this._submit(this.segment);
       this.segment = "";
     }
+    log("TTS", `${this.label}: ${this.sentences.length} segment(s) submitted, synthesizing…`);
   }
 
   // Resolve once EVERY segment has been synthesized. Call finishInput() first.
@@ -225,6 +234,8 @@ class PreparedTurn {
     this.nextTime = this.ctx.currentTime;
     let shown = "";
     let lastSrc = null;
+    const n = this.chunks.length;
+    log("PLAY", `${this.label}: now speaking (${n} segment(s))`);
 
     for (let i = 0; i < this.chunks.length; i++) {
       if (this.canceled) return;
@@ -242,8 +253,15 @@ class PreparedTurn {
         lastSrc = src;
         // Reveal this segment's text exactly when its audio starts.
         const reveal = shown;
+        const segNo = i + 1;
         const delayMs = Math.max(0, (startAt - this.ctx.currentTime) * 1000);
-        this.timers.push(setTimeout(() => !this.canceled && onReveal?.(reveal), delayMs));
+        this.timers.push(
+          setTimeout(() => {
+            if (this.canceled) return;
+            log("PLAY", `${this.label}: seg ${segNo}/${n} audible`);
+            onReveal?.(reveal);
+          }, delayMs)
+        );
       } else {
         onReveal?.(shown);
       }
@@ -257,6 +275,7 @@ class PreparedTurn {
         if (this.ctx.currentTime >= this.nextTime) resolve();
       });
     }
+    if (!this.canceled) log("PLAY", `${this.label}: finished speaking`);
   }
 
   // Queue one segment to start the moment the previous one ends (or now, if we

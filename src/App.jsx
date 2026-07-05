@@ -2,6 +2,7 @@ import { useRef, useState, useCallback } from "react";
 import { MODELS, DEFAULT_MODEL, getEngine, streamTurn, isWebGPUAvailable } from "./lib/llm.js";
 import { buildTurnPrompt } from "./lib/debate.js";
 import { TTSBackend } from "./lib/tts.js";
+import { log } from "./lib/logger.js";
 import { PRESET_CHARACTERS, VOICES, makeCharacter } from "./config/characters.js";
 import { PRESET_TOPICS, randomTopic } from "./config/topics.js";
 import DebaterCard from "./components/DebaterCard.jsx";
@@ -49,6 +50,7 @@ export default function App() {
 
   async function ensureTTS() {
     setStatus("Loading Piper voices…");
+    log("TTS", `Loading Piper voices: ${charA.voice}, ${charB.voice}…`);
     // Piper (VITS) is a much lighter neural TTS than Kokoro — it runs on the CPU
     // (multi-threaded onnxruntime via the cross-origin isolation headers), so the
     // GPU stays entirely with WebLLM. We pre-download just the two debaters'
@@ -93,24 +95,30 @@ export default function App() {
     }
     setTranscript([]);
     setPhase(PHASES.LOADING);
+    log("DEBATE", `Start · "${topic}" · ${model} · ${turns} turns · ${charA.name} vs ${charB.name}`);
 
     try {
       setStatus("Loading debate model… first time downloads a few hundred MB, then it's cached.");
+      log("LLM", `Loading model ${model}…`);
       const engine = await getEngine(model, (r) => {
         setStatus(r.text || "Loading model…");
         if (r.progress != null) setProgress(Math.round(r.progress * 100));
       });
       engineRef.current = engine;
+      log("LLM", "Model ready");
 
       ttsRef.current = await ensureTTS();
 
       setPhase(PHASES.DEBATING);
       setStatus("");
+      log("DEBATE", "Everything loaded — debate begins");
       await runLoop(engine);
       setStatus("Debate complete.");
       setPhase(PHASES.DONE);
+      log("DEBATE", "Complete");
     } catch (e) {
       console.error(e);
+      log("WARN", `Debate aborted: ${String(e?.message || e)}`);
       setError(String(e?.message || e));
       setPhase(PHASES.SETUP);
     } finally {
@@ -136,6 +144,7 @@ export default function App() {
       const isA = turnIndex % 2 === 0;
       const character = isA ? charA : charB;
       const opponent = isA ? charB : charA;
+      const label = `Turn ${turnIndex + 1} (${isA ? "A" : "B"} · ${character.name})`;
       const { system, user } = buildTurnPrompt({
         character,
         opponent,
@@ -144,16 +153,25 @@ export default function App() {
         isOpening: turnIndex < 2,
       });
 
-      const prep = tts.prepareTurn({ voice: character.voice });
+      const prep = tts.prepareTurn({ voice: character.voice, label });
       prefetchRef.current = prep;
 
+      log("LLM", `${label}: generating…`);
+      const genStart = performance.now();
       let text = "";
+      let firstToken = false;
       for await (const delta of streamTurn(engine, system, user)) {
         if (!runningRef.current) break;
+        if (!firstToken) {
+          firstToken = true;
+          log("LLM", `${label}: first token (${Math.round(performance.now() - genStart)}ms)`);
+        }
         text += delta;
         prep.push(delta); // synth starts now, during generation
       }
       prep.finishInput();
+      const words = text.trim().split(/\s+/).filter(Boolean).length;
+      log("LLM", `${label}: finished — ${words} words in ${Math.round(performance.now() - genStart)}ms`);
       // Record into context so the NEXT prepared turn can rebut it.
       local.push({ speakerName: character.name, text });
       // Deliberately DON'T wait for full synthesis here. A turn is "ready" the
@@ -182,11 +200,19 @@ export default function App() {
         setActiveSpeaker(null);
         setStatus("Preparing next turn…");
       }
+      const waitStart = performance.now();
       const cur = await pending; // its text + audio are ready
       if (!runningRef.current) break;
+      const waitMs = Math.round(performance.now() - waitStart);
+      if (turn > 0 && waitMs > 150) {
+        log("DEBATE", `waited ${waitMs}ms for Turn ${turn + 1} to be ready (pipeline behind)`);
+      }
 
       // Kick off the NEXT turn now, so it prepares while this one speaks.
-      if (turn + 1 < turns) pending = prepareTurn(turn + 1);
+      if (turn + 1 < turns) {
+        log("DEBATE", `prefetching Turn ${turn + 2} in the background`);
+        pending = prepareTurn(turn + 1);
+      }
 
       // Present the current turn: reveal its bubble and play its voice. The glow
       // is on ONLY for the duration of play() — i.e. only while audio is heard.
@@ -202,6 +228,7 @@ export default function App() {
   }
 
   function stop() {
+    if (runningRef.current) log("DEBATE", "Stop requested — interrupting generation & audio");
     debateActive = false;
     runningRef.current = false;
     // Breaking the for-await does NOT stop WebLLM's decode loop — we must
