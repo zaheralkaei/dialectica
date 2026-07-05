@@ -32,8 +32,9 @@ const MIN_SEGMENT_CHARS = 240;
 const SYNTH_TIMEOUT_MS = 90000;
 
 export class KokoroBackend {
-  constructor(worker, ctx = null) {
+  constructor(worker, ctx = null, device = "wasm") {
     this.worker = worker;
+    this.device = device; // which backend actually loaded ("webgpu" | "wasm")
     // The AudioContext may be created (and resumed) by the caller inside the
     // user-gesture handler and passed in — browsers only let audio start after
     // a user activation, and by the time the first turn is synthesized we're
@@ -54,7 +55,9 @@ export class KokoroBackend {
         console.warn(`Kokoro synth error for segment ${m.id}: ${m.error}`);
         p.resolve(null);
       } else {
-        p.resolve(m); // { audio: Float32Array, sampling_rate }
+        // Timing is logged so a slow backend is diagnosable from the console.
+        console.debug(`Kokoro segment ${m.id} synthesized in ${m.ms}ms on ${this.device}`);
+        p.resolve(m); // { audio, sampling_rate, ms }
       }
     });
   }
@@ -63,12 +66,18 @@ export class KokoroBackend {
     const worker = new Worker(new URL("./kokoroWorker.js", import.meta.url), {
       type: "module",
     });
+    let loadedDevice = device;
     await new Promise((resolve, reject) => {
       const onMsg = (e) => {
         const m = e.data;
         if (m.type === "progress") onProgress?.(m.p);
         else if (m.type === "ready") {
           worker.removeEventListener("message", onMsg);
+          loadedDevice = m.device || device;
+          if (m.fellBackFrom) {
+            console.warn(`Kokoro fell back from ${m.fellBackFrom} to wasm: ${m.reason}`);
+          }
+          console.info(`Kokoro voice model ready on ${loadedDevice}`);
           resolve();
         } else if (m.type === "error") {
           worker.removeEventListener("message", onMsg);
@@ -78,7 +87,7 @@ export class KokoroBackend {
       worker.addEventListener("message", onMsg);
       worker.postMessage({ type: "load", dtype, device });
     });
-    return new KokoroBackend(worker, audioCtx);
+    return new KokoroBackend(worker, audioCtx, loadedDevice);
   }
 
   _audioCtx() {

@@ -49,13 +49,16 @@ export default function App() {
 
   async function ensureTTS() {
     setStatus("Loading Kokoro voice model…");
-    // Kokoro runs on WASM, NOT WebGPU — on purpose. The debate LLM (WebLLM)
-    // already owns the GPU, and running a second WebGPU runtime (Kokoro via
-    // onnxruntime-web) alongside it makes the two contend for the device and
-    // stall the LLM. WASM keeps the GPU exclusively for generation. Kokoro-82M
-    // at q8 is small enough to synthesize faster than real-time on the CPU.
+    // Prefer WebGPU for Kokoro: single-threaded WASM synthesis (~10s/segment) is
+    // too slow to stay ahead of playback, which caused between-turn gaps and
+    // synth timeouts; a worker pool doesn't help because WASM inference is
+    // memory-bandwidth bound, not CPU bound. WebGPU is an order of magnitude
+    // faster. The worker validates WebGPU with a warm-up synth and falls back to
+    // WASM automatically if it isn't usable, so this can't be worse than WASM.
+    // Yes, the LLM also uses the GPU, but turns are short and mostly sequential,
+    // so brief overlap is a fine trade for synthesis that keeps up.
     return KokoroBackend.load({
-      device: "wasm",
+      device: "webgpu",
       dtype: "q8",
       audioCtx: audioCtxRef.current,
       onProgress: (p) => {
