@@ -158,17 +158,23 @@ export default function App() {
         prep.push(delta); // synth starts now, during generation
       }
       prep.finishInput();
-      // Fully synthesize the whole turn before it's considered "prepared", so
-      // playback is gapless. This wait overlaps the previous turn's speech.
-      await prep.ready();
       // Record into context so the NEXT prepared turn can rebut it.
       local.push({ speakerName: character.name, text });
+      // Deliberately DON'T wait for full synthesis here. A turn is "ready" the
+      // moment its text is generated; its audio segments keep synthesizing in
+      // the background and play() streams them in as it reaches them. Waiting
+      // for the whole turn to synthesize is what caused the "Preparing next
+      // turn…" stall: synth of a full turn can outlast the previous turn's
+      // playback. Generation alone always finishes well within that playback,
+      // so returning now keeps the hand-off seamless — and for every turn after
+      // the opening the segments have had the entire previous turn to finish, so
+      // playback is still gapless.
       return { turnIndex, speaker: isA ? "A" : "B", character, prep };
     }
 
-    // Start preparing the very first turn (generate + fully synthesize its
-    // audio). Only the opening incurs this wait — every later turn is prepared
-    // in the background while the previous debater is speaking.
+    // Start preparing the very first turn. Only the opening incurs a visible
+    // wait (for its text + first audio segment); every later turn is prepared in
+    // the background while the previous debater is speaking.
     setStatus("Preparing opening statement (generating + synthesizing voice)…");
     let pending = prepareTurn(0);
 
