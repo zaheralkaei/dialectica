@@ -177,6 +177,23 @@ textarea:disabled,
 select:disabled {
   opacity: 0.6;
 }
+.checkline {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  cursor: pointer;
+}
+.checkline input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.checkline > span {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
 
 /* Controls */
 .controls {

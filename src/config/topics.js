@@ -1,4 +1,4 @@
-// Prepared debate motions. Phrased as statements so one side argues FOR and the
+// Prepared debate topics. Phrased as statements so one side argues FOR and the
 // other AGAINST.
 
 export const PRESET_TOPICS = [

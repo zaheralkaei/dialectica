@@ -10,6 +10,10 @@ import Transcript from "./components/Transcript.jsx";
 
 const PHASES = { SETUP: "setup", LOADING: "loading", DEBATING: "debating", DONE: "done" };
 
+// Most transcript bubbles kept on screen at once (indefinite debates would
+// otherwise grow the DOM forever).
+const MAX_BUBBLES = 40;
+
 // Module-level guard so a second debate can never run concurrently with one
 // already in flight (a component-ref guard could be defeated by a remount).
 let debateActive = false;
@@ -19,6 +23,7 @@ export default function App() {
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [topic, setTopic] = useState(PRESET_TOPICS[0]);
   const [turns, setTurns] = useState(6);
+  const [infinite, setInfinite] = useState(false);
   const [charA, setCharA] = useState(() => makeCharacter(PRESET_CHARACTERS[0], "for"));
   const [charB, setCharB] = useState(() => makeCharacter(PRESET_CHARACTERS[1], "against"));
 
@@ -40,7 +45,13 @@ export default function App() {
 
   const appendEntry = useCallback((speaker, char) => {
     const id = ++idRef.current;
-    setTranscript((t) => [...t, { id, speaker, speakerName: char.name, emoji: char.emoji, color: char.color, text: "" }]);
+    // Cap the rendered transcript so an indefinite debate can't grow the DOM
+    // without bound — older bubbles scroll off and are dropped.
+    setTranscript((t) =>
+      [...t, { id, speaker, speakerName: char.name, emoji: char.emoji, color: char.color, text: "" }].slice(
+        -MAX_BUBBLES
+      )
+    );
     return id;
   }, []);
 
@@ -95,7 +106,10 @@ export default function App() {
     }
     setTranscript([]);
     setPhase(PHASES.LOADING);
-    log("DEBATE", `Start · "${topic}" · ${model} · ${turns} turns · ${charA.name} vs ${charB.name}`);
+    log(
+      "DEBATE",
+      `Start · "${topic}" · ${model} · ${infinite ? "∞" : turns} turns · ${charA.name} vs ${charB.name}`
+    );
 
     try {
       setStatus("Loading debate model… first time downloads a few hundred MB, then it's cached.");
@@ -136,6 +150,7 @@ export default function App() {
   //     nothing is spoken until it's actually their turn.
   async function runLoop(engine) {
     const tts = ttsRef.current;
+    const totalTurns = infinite ? Infinity : turns;
     const local = []; // running transcript used to build each prompt
 
     // Generate + synthesize one turn without displaying or playing it.
@@ -172,8 +187,11 @@ export default function App() {
       prep.finishInput();
       const words = text.trim().split(/\s+/).filter(Boolean).length;
       log("LLM", `${label}: finished — ${words} words in ${Math.round(performance.now() - genStart)}ms`);
-      // Record into context so the NEXT prepared turn can rebut it.
+      // Record into context so the NEXT prepared turn can rebut it. Only the last
+      // few are ever used (see HISTORY_WINDOW), so trim to keep memory flat over
+      // an indefinite debate.
       local.push({ speakerName: character.name, text });
+      if (local.length > 6) local.splice(0, local.length - 6);
       // Deliberately DON'T wait for full synthesis here. A turn is "ready" the
       // moment its text is generated; its audio segments keep synthesizing in
       // the background and play() streams them in as it reaches them. Waiting
@@ -192,7 +210,7 @@ export default function App() {
     setStatus("Preparing opening statement (generating + synthesizing voice)…");
     let pending = prepareTurn(0);
 
-    for (let turn = 0; turn < turns; turn++) {
+    for (let turn = 0; turn < totalTurns; turn++) {
       // While we wait for this turn to be ready, nobody is speaking — clear the
       // glow so it never lingers on a debater who has gone silent. If the turn
       // is already prepared (the common case), this "wait" is instant.
@@ -209,7 +227,7 @@ export default function App() {
       }
 
       // Kick off the NEXT turn now, so it prepares while this one speaks.
-      if (turn + 1 < turns) {
+      if (turn + 1 < totalTurns) {
         log("DEBATE", `prefetching Turn ${turn + 2} in the background`);
         pending = prepareTurn(turn + 1);
       }
@@ -273,7 +291,7 @@ export default function App() {
       <div className="stage">
         <DebaterCard
           side="A"
-          label="For the motion"
+          label="For the topic"
           character={charA}
           onChange={setCharA}
           presets={PRESET_CHARACTERS}
@@ -286,7 +304,7 @@ export default function App() {
 
         <DebaterCard
           side="B"
-          label="Against the motion"
+          label="Against the topic"
           character={charB}
           onChange={setCharB}
           presets={PRESET_CHARACTERS}
@@ -305,7 +323,7 @@ export default function App() {
               value={topic}
               disabled={busy}
               onChange={(e) => setTopic(e.target.value)}
-              placeholder="Type a motion, or pick one →"
+              placeholder="Type a topic, or pick one →"
             />
             <button className="ghost" disabled={busy} onClick={() => setTopic(randomTopic())} title="Random topic">
               🎲
@@ -316,7 +334,7 @@ export default function App() {
             value=""
             onChange={(e) => e.target.value && setTopic(e.target.value)}
           >
-            <option value="">Prepared motions…</option>
+            <option value="">Prepared topics…</option>
             {PRESET_TOPICS.map((t) => (
               <option key={t} value={t}>
                 {t}
@@ -338,16 +356,25 @@ export default function App() {
           </label>
 
           <label className="field">
-            <span>Total turns: {turns}</span>
+            <span>Length: {infinite ? "∞ until you stop" : `${turns} turns`}</span>
             <input
               type="range"
               min="2"
               max="12"
               step="2"
               value={turns}
-              disabled={busy}
+              disabled={busy || infinite}
               onChange={(e) => setTurns(Number(e.target.value))}
             />
+            <label className="checkline">
+              <input
+                type="checkbox"
+                checked={infinite}
+                disabled={busy}
+                onChange={(e) => setInfinite(e.target.checked)}
+              />
+              <span>Debate indefinitely (until you press Stop)</span>
+            </label>
           </label>
         </div>
 

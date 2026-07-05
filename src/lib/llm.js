@@ -41,7 +41,11 @@ export async function* streamTurn(
   engine,
   systemPrompt,
   userPrompt,
-  { temperature = 0.85, max_tokens = 220 } = {}
+  // Hard cap on turn length. The prompt asks for ~60 words; this ceiling
+  // (~90 words) stops the model rambling into 150+ word turns, which is the
+  // single biggest speed win — shorter turns are faster to both generate AND
+  // synthesize, and keep the pipeline from falling behind.
+  { temperature = 0.85, max_tokens = 120 } = {}
 ) {
   const chunks = await engine.chat.completions.create({
     messages: [

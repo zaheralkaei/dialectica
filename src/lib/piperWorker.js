@@ -16,6 +16,22 @@ import * as piper from "@diffusionstudio/vits-web";
 // it finishes so segment 1 never waits behind segment 2.
 let genChain = Promise.resolve();
 
+// Normalize text before synthesis. The espeak phonemizer can emit a phoneme id
+// outside the model's range for some non-ASCII punctuation (smart quotes, em
+// dashes, ellipses), which makes onnxruntime throw "Gather ... out of bounds"
+// and drops the whole segment. Folding that punctuation to plain ASCII (and
+// dropping anything still exotic) avoids it — and reads better aloud anyway.
+function cleanText(text) {
+  return text
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[–—]/g, ", ")
+    .replace(/…/g, "...")
+    .replace(/[^\x00-\x7F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // vits-web returns a standard 16-bit PCM mono WAV Blob. Decode it to the
 // Float32Array + sample rate the audio pipeline schedules directly.
 function wavToFloat32(buf) {
@@ -76,7 +92,8 @@ self.onmessage = async (e) => {
     genChain = genChain.then(async () => {
       const t0 = performance.now();
       try {
-        const blob = await piper.predict({ text: msg.text, voiceId: msg.voice });
+        const text = cleanText(msg.text) || msg.text;
+        const blob = await piper.predict({ text, voiceId: msg.voice });
         const { audio, sampling_rate } = wavToFloat32(await blob.arrayBuffer());
         self.postMessage(
           { type: "audio", id: msg.id, audio, sampling_rate, ms: Math.round(performance.now() - t0) },
