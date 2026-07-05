@@ -26,7 +26,10 @@ const MIN_SEGMENT_CHARS = 240;
 
 // Safety net: if the worker never returns a segment (crash, unexpected state),
 // give up on it after this long so a single segment can't stall the debate.
-const SYNTH_TIMEOUT_MS = 30000;
+// Generous because Kokoro runs single-threaded (see vite.config.js) — the first
+// segment also pays voice-load + WASM warm-up, so it can take 10s+ on a modest
+// machine. Too tight a timeout here is itself a cause of silent playback.
+const SYNTH_TIMEOUT_MS = 90000;
 
 export class KokoroBackend {
   constructor(worker, ctx = null) {

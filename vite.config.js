@@ -1,16 +1,13 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Cross-origin isolation headers. These make `self.crossOriginIsolated` true,
-// which (a) enables SharedArrayBuffer and therefore multi-threaded onnxruntime
-// WASM — transformers.js auto-scales Kokoro to several threads, 2–4× faster —
-// and (b) is inherited by our Web Workers. COEP "credentialless" is used (not
-// "require-corp") so WebLLM's cross-origin model downloads from the Hugging
-// Face CDN still succeed.
-const coiHeaders = {
-  "Cross-Origin-Opener-Policy": "same-origin",
-  "Cross-Origin-Embedder-Policy": "credentialless",
-};
+// NOTE: We deliberately do NOT set cross-origin isolation (COOP/COEP) headers.
+// They make `self.crossOriginIsolated` true, which would let onnxruntime spin up
+// multi-threaded WASM for Kokoro — but in the *production* bundle that nested
+// pthread-worker path fails to load and every synth call hangs (times out),
+// leaving the debate silent. WebLLM only needs WebGPU (not isolation), so
+// running Kokoro single-threaded is the reliable choice: a touch slower to
+// synthesize, but it actually produces audio in a built/deployed app.
 
 // WebLLM and kokoro-js ship large WASM/worker assets. We exclude them from
 // dep pre-bundling so Vite serves their internal workers/wasm correctly.
@@ -26,6 +23,4 @@ export default defineConfig({
   worker: {
     format: "es",
   },
-  server: { headers: coiHeaders },
-  preview: { headers: coiHeaders },
 });
