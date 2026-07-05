@@ -1,0 +1,19 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# Single-page app fallback.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Cross-origin isolation → SharedArrayBuffer → multi-threaded onnxruntime WASM,
+# which makes Kokoro synthesis 2–4× faster. COEP "credentialless" keeps WebLLM's
+# cross-origin model downloads from the Hugging Face CDN working (unlike
+# "require-corp", which would block them).
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "credentialless"

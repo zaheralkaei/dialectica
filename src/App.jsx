@@ -1,0 +1,345 @@
+import { useRef, useState, useCallback } from "react";
+import { MODELS, DEFAULT_MODEL, getEngine, streamTurn, isWebGPUAvailable } from "./lib/llm.js";
+import { buildTurnPrompt } from "./lib/debate.js";
+import { KokoroBackend } from "./lib/tts.js";
+import { PRESET_CHARACTERS, KOKORO_VOICES, makeCharacter } from "./config/characters.js";
+import { PRESET_TOPICS, randomTopic } from "./config/topics.js";
+import DebaterCard from "./components/DebaterCard.jsx";
+import Transcript from "./components/Transcript.jsx";
+
+const PHASES = { SETUP: "setup", LOADING: "loading", DEBATING: "debating", DONE: "done" };
+
+// Module-level guard so a second debate can never run concurrently with one
+// already in flight (a component-ref guard could be defeated by a remount).
+let debateActive = false;
+
+export default function App() {
+  const [phase, setPhase] = useState(PHASES.SETUP);
+  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [topic, setTopic] = useState(PRESET_TOPICS[0]);
+  const [turns, setTurns] = useState(6);
+  const [charA, setCharA] = useState(() => makeCharacter(PRESET_CHARACTERS[0], "for"));
+  const [charB, setCharB] = useState(() => makeCharacter(PRESET_CHARACTERS[1], "against"));
+
+  const [transcript, setTranscript] = useState([]);
+  const [status, setStatus] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [activeSpeaker, setActiveSpeaker] = useState(null); // "A" | "B" | null
+  const [error, setError] = useState("");
+
+  const runningRef = useRef(false);
+  const ttsRef = useRef(null);
+  const sessionRef = useRef(null); // the turn currently PLAYING
+  const prefetchRef = useRef(null); // the next turn being PREPARED silently
+  const engineRef = useRef(null);
+  const idRef = useRef(0);
+
+  const webgpu = isWebGPUAvailable();
+
+  const appendEntry = useCallback((speaker, char) => {
+    const id = ++idRef.current;
+    setTranscript((t) => [...t, { id, speaker, speakerName: char.name, emoji: char.emoji, color: char.color, text: "" }]);
+    return id;
+  }, []);
+
+  const updateEntry = useCallback((id, text) => {
+    setTranscript((t) => t.map((e) => (e.id === id ? { ...e, text } : e)));
+  }, []);
+
+  async function ensureTTS() {
+    setStatus("Loading Kokoro voice model…");
+    // Kokoro runs on WASM, NOT WebGPU — on purpose. The debate LLM (WebLLM)
+    // already owns the GPU, and running a second WebGPU runtime (Kokoro via
+    // onnxruntime-web) alongside it makes the two contend for the device and
+    // stall the LLM. WASM keeps the GPU exclusively for generation. Kokoro-82M
+    // at q8 is small enough to synthesize faster than real-time on the CPU.
+    return KokoroBackend.load({
+      device: "wasm",
+      dtype: "q8",
+      onProgress: (p) => {
+        if (p?.progress != null) setProgress(Math.round(p.progress));
+        if (p?.status) setStatus(`Kokoro: ${p.file || p.status} ${p.progress ? Math.round(p.progress) + "%" : ""}`);
+      },
+    });
+  }
+
+  async function start() {
+    // Re-entrancy guard: never let a second debate loop run while one is already
+    // in flight, or two loops would generate and PLAY over each other.
+    if (debateActive) return;
+    debateActive = true;
+    runningRef.current = true;
+
+    setError("");
+    if (!webgpu) {
+      debateActive = false;
+      runningRef.current = false;
+      setError(
+        "WebGPU isn't available in this browser. Use the latest Chrome or Edge (desktop) — the on-device LLM needs WebGPU."
+      );
+      return;
+    }
+    setTranscript([]);
+    setPhase(PHASES.LOADING);
+
+    try {
+      setStatus("Loading debate model… first time downloads a few hundred MB, then it's cached.");
+      const engine = await getEngine(model, (r) => {
+        setStatus(r.text || "Loading model…");
+        if (r.progress != null) setProgress(Math.round(r.progress * 100));
+      });
+      engineRef.current = engine;
+
+      ttsRef.current = await ensureTTS();
+
+      setPhase(PHASES.DEBATING);
+      setStatus("");
+      await runLoop(engine);
+      setStatus("Debate complete.");
+      setPhase(PHASES.DONE);
+    } catch (e) {
+      console.error(e);
+      setError(String(e?.message || e));
+      setPhase(PHASES.SETUP);
+    } finally {
+      debateActive = false;
+      runningRef.current = false;
+      setActiveSpeaker(null);
+    }
+  }
+
+  // Pipelined debate:
+  //   • Each turn's audio is synthesized WHILE the LLM is still writing it
+  //     (KokoroPreparedTurn.push feeds the worker per sentence).
+  //   • While a debater is SPEAKING, the next debater's turn is already being
+  //     generated + synthesized in the background — but nothing is printed and
+  //     nothing is spoken until it's actually their turn.
+  async function runLoop(engine) {
+    const tts = ttsRef.current;
+    const local = []; // running transcript used to build each prompt
+
+    // Generate + synthesize one turn without displaying or playing it.
+    // Returns everything needed to present it later.
+    async function prepareTurn(turnIndex) {
+      const isA = turnIndex % 2 === 0;
+      const character = isA ? charA : charB;
+      const opponent = isA ? charB : charA;
+      const { system, user } = buildTurnPrompt({
+        character,
+        opponent,
+        topic,
+        transcript: local,
+        isOpening: turnIndex < 2,
+      });
+
+      const prep = tts.prepareTurn({ kokoroVoice: character.kokoroVoice });
+      prefetchRef.current = prep;
+
+      let text = "";
+      for await (const delta of streamTurn(engine, system, user)) {
+        if (!runningRef.current) break;
+        text += delta;
+        prep.push(delta); // synth starts now, during generation
+      }
+      prep.finishInput();
+      // Fully synthesize the whole turn before it's considered "prepared", so
+      // playback is gapless. This wait overlaps the previous turn's speech.
+      await prep.ready();
+      // Record into context so the NEXT prepared turn can rebut it.
+      local.push({ speakerName: character.name, text });
+      return { turnIndex, speaker: isA ? "A" : "B", character, prep };
+    }
+
+    // Start preparing the very first turn (generate + fully synthesize its
+    // audio). Only the opening incurs this wait — every later turn is prepared
+    // in the background while the previous debater is speaking.
+    setStatus("Preparing opening statement (generating + synthesizing voice)…");
+    let pending = prepareTurn(0);
+
+    for (let turn = 0; turn < turns; turn++) {
+      // While we wait for this turn to be ready, nobody is speaking — clear the
+      // glow so it never lingers on a debater who has gone silent. If the turn
+      // is already prepared (the common case), this "wait" is instant.
+      if (turn > 0) {
+        setActiveSpeaker(null);
+        setStatus("Preparing next turn…");
+      }
+      const cur = await pending; // its text + audio are ready
+      if (!runningRef.current) break;
+
+      // Kick off the NEXT turn now, so it prepares while this one speaks.
+      if (turn + 1 < turns) pending = prepareTurn(turn + 1);
+
+      // Present the current turn: reveal its bubble and play its voice. The glow
+      // is on ONLY for the duration of play() — i.e. only while audio is heard.
+      setStatus("");
+      setActiveSpeaker(cur.speaker);
+      const entryId = appendEntry(cur.speaker, cur.character);
+      sessionRef.current = cur.prep;
+
+      // play() reveals each segment's text as its audio begins.
+      await cur.prep.play((revealed) => updateEntry(entryId, revealed));
+      if (!runningRef.current) break;
+    }
+  }
+
+  function stop() {
+    debateActive = false;
+    runningRef.current = false;
+    // Breaking the for-await does NOT stop WebLLM's decode loop — we must
+    // explicitly interrupt it, or the engine stays busy and the next debate
+    // queues behind a request that never ends.
+    try {
+      engineRef.current?.interruptGenerate();
+    } catch {}
+    sessionRef.current?.cancel();
+    prefetchRef.current?.cancel();
+    ttsRef.current?.cancel();
+    setActiveSpeaker(null);
+    setStatus("Stopped.");
+    setPhase(PHASES.DONE);
+  }
+
+  function reset() {
+    stop();
+    setTranscript([]);
+    setPhase(PHASES.SETUP);
+    setStatus("");
+  }
+
+  const busy = phase === PHASES.LOADING || phase === PHASES.DEBATING;
+
+  return (
+    <div className="app">
+      <header className="hero">
+        <h1>
+          🗣️ Dialectica
+        </h1>
+        <p className="tagline">Two AI minds debate any topic — with streaming voices, entirely in your browser.</p>
+      </header>
+
+      {!webgpu && (
+        <div className="banner warn">
+          ⚠️ WebGPU not detected. The on-device LLM needs it — try the latest Chrome or Edge.
+        </div>
+      )}
+      {error && <div className="banner error">{error}</div>}
+
+      <div className="stage">
+        <DebaterCard
+          side="A"
+          label="For the motion"
+          character={charA}
+          onChange={setCharA}
+          presets={PRESET_CHARACTERS}
+          kokoroVoices={KOKORO_VOICES}
+          active={activeSpeaker === "A"}
+          disabled={busy}
+        />
+
+        <div className="vs">VS</div>
+
+        <DebaterCard
+          side="B"
+          label="Against the motion"
+          character={charB}
+          onChange={setCharB}
+          presets={PRESET_CHARACTERS}
+          kokoroVoices={KOKORO_VOICES}
+          active={activeSpeaker === "B"}
+          disabled={busy}
+        />
+      </div>
+
+      <div className="controls">
+        <label className="field topic">
+          <span>Debate topic</span>
+          <div className="topic-row">
+            <input
+              type="text"
+              value={topic}
+              disabled={busy}
+              onChange={(e) => setTopic(e.target.value)}
+              placeholder="Type a motion, or pick one →"
+            />
+            <button className="ghost" disabled={busy} onClick={() => setTopic(randomTopic())} title="Random topic">
+              🎲
+            </button>
+          </div>
+          <select
+            disabled={busy}
+            value=""
+            onChange={(e) => e.target.value && setTopic(e.target.value)}
+          >
+            <option value="">Prepared motions…</option>
+            {PRESET_TOPICS.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <div className="settings">
+          <label className="field">
+            <span>Model (WebGPU)</span>
+            <select value={model} disabled={busy} onChange={(e) => setModel(e.target.value)}>
+              {MODELS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Total turns: {turns}</span>
+            <input
+              type="range"
+              min="2"
+              max="12"
+              step="2"
+              value={turns}
+              disabled={busy}
+              onChange={(e) => setTurns(Number(e.target.value))}
+            />
+          </label>
+        </div>
+
+        <div className="actions">
+          {phase === PHASES.SETUP || phase === PHASES.DONE ? (
+            <button className="primary" onClick={start} disabled={!webgpu}>
+              ▶ Start debate
+            </button>
+          ) : (
+            <button className="danger" onClick={stop}>
+              ■ Stop
+            </button>
+          )}
+          {transcript.length > 0 && !busy && (
+            <button className="ghost" onClick={reset}>
+              ↺ Reset
+            </button>
+          )}
+        </div>
+      </div>
+
+      {(busy || status) && (
+        <div className="status">
+          {phase === PHASES.LOADING && (
+            <div className="progressbar">
+              <div className="fill" style={{ width: `${progress}%` }} />
+            </div>
+          )}
+          <span>{status}</span>
+        </div>
+      )}
+
+      <Transcript entries={transcript} activeSpeaker={activeSpeaker} />
+
+      <footer className="foot">
+        Runs 100% in your browser · No backend · No API keys · Models cached after first load
+      </footer>
+    </div>
+  );
+}
