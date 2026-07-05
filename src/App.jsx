@@ -49,16 +49,15 @@ export default function App() {
 
   async function ensureTTS() {
     setStatus("Loading Kokoro voice model…");
-    // Prefer WebGPU for Kokoro: single-threaded WASM synthesis (~10s/segment) is
-    // too slow to stay ahead of playback, which caused between-turn gaps and
-    // synth timeouts; a worker pool doesn't help because WASM inference is
-    // memory-bandwidth bound, not CPU bound. WebGPU is an order of magnitude
-    // faster. The worker validates WebGPU with a warm-up synth and falls back to
-    // WASM automatically if it isn't usable, so this can't be worse than WASM.
-    // Yes, the LLM also uses the GPU, but turns are short and mostly sequential,
-    // so brief overlap is a fine trade for synthesis that keeps up.
+    // Kokoro runs on WASM, NOT WebGPU — on purpose. WebLLM already fills the GPU
+    // with the debate model (~2 GB for the 3B); adding Kokoro's weights on top
+    // exhausts VRAM and the WebGPU device gets *lost*, which crashes the LLM
+    // mid-debate. WASM keeps synthesis on the CPU so the GPU stays exclusively
+    // for the LLM. Speed comes from multi-threading instead: the cross-origin
+    // isolation headers (see vite.config.js / netlify.toml) enable
+    // SharedArrayBuffer, so onnxruntime scales Kokoro across CPU threads.
     return KokoroBackend.load({
-      device: "webgpu",
+      device: "wasm",
       dtype: "q8",
       audioCtx: audioCtxRef.current,
       onProgress: (p) => {

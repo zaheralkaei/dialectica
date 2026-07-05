@@ -8,9 +8,13 @@
   to = "/index.html"
   status = 200
 
-# NOTE: intentionally no cross-origin isolation (COOP/COEP) headers. Enabling
-# them turns on onnxruntime's multi-threaded WASM, whose nested pthread-worker
-# path breaks in the production bundle and makes every Kokoro synth hang (30s
-# timeout) — the debate runs but stays silent. Single-threaded Kokoro is a bit
-# slower but actually produces audio when deployed. WebLLM uses WebGPU and does
-# not need isolation.
+# Cross-origin isolation → SharedArrayBuffer → multi-threaded onnxruntime WASM,
+# which keeps Kokoro synthesis fast on the CPU (2–4× vs single-thread) while
+# leaving the GPU entirely to WebLLM (running Kokoro on WebGPU exhausts VRAM and
+# crashes the LLM). COEP "credentialless" keeps WebLLM's cross-origin model
+# downloads from the Hugging Face CDN working (unlike "require-corp").
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "credentialless"
