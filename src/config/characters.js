@@ -1,21 +1,51 @@
 // Preset debater personas. Each has a persona prompt and a Piper voice id.
+// The `voice` field is engine-agnostic: for Piper it's the voice ID string; for
+// Web Speech it carries a { lang, gender } hint that maps to a system voice.
 
 // Piper (VITS) voices, from the diffusionstudio/piper-voices set. Each is a
 // separate ~20–60 MB download fetched + cached (OPFS) on first use.
 export const VOICES = [
-  { id: "en_US-hfc_female-medium", label: "Heather (US female, warm)" },
-  { id: "en_US-amy-medium", label: "Amy (US female, bright)" },
-  { id: "en_US-lessac-medium", label: "Lessac (US female, clear)" },
-  { id: "en_US-kristin-medium", label: "Kristin (US female, soft)" },
-  { id: "en_GB-jenny_dioco-medium", label: "Jenny (UK female, crisp)" },
-  { id: "en_GB-alba-medium", label: "Alba (UK female)" },
-  { id: "en_US-hfc_male-medium", label: "Harrison (US male, steady)" },
-  { id: "en_US-ryan-high", label: "Ryan (US male, punchy)" },
-  { id: "en_US-joe-medium", label: "Joe (US male, deep)" },
-  { id: "en_GB-alan-medium", label: "Alan (UK male, measured)" },
-  { id: "en_GB-northern_english_male-medium", label: "Cedric (UK male, storyteller)" },
-  { id: "en_US-libritts_r-medium", label: "Miles (US male, expressive)" },
+  { id: "en_US-hfc_female-medium", label: "Heather (US female, warm)", hint: { lang: "en-US", gender: "female" } },
+  { id: "en_US-amy-medium", label: "Amy (US female, bright)", hint: { lang: "en-US", gender: "female" } },
+  { id: "en_US-lessac-medium", label: "Lessac (US female, clear)", hint: { lang: "en-US", gender: "female" } },
+  { id: "en_US-kristin-medium", label: "Kristin (US female, soft)", hint: { lang: "en-US", gender: "female" } },
+  { id: "en_GB-jenny_dioco-medium", label: "Jenny (UK female, crisp)", hint: { lang: "en-GB", gender: "female" } },
+  { id: "en_GB-alba-medium", label: "Alba (UK female)", hint: { lang: "en-GB", gender: "female" } },
+  { id: "en_US-hfc_male-medium", label: "Harrison (US male, steady)", hint: { lang: "en-US", gender: "male" } },
+  { id: "en_US-ryan-high", label: "Ryan (US male, punchy)", hint: { lang: "en-US", gender: "male" } },
+  { id: "en_US-joe-medium", label: "Joe (US male, deep)", hint: { lang: "en-US", gender: "male" } },
+  { id: "en_GB-alan-medium", label: "Alan (UK male, measured)", hint: { lang: "en-GB", gender: "male" } },
+  { id: "en_GB-northern_english_male-medium", label: "Cedric (UK male, storyteller)", hint: { lang: "en-GB", gender: "male" } },
+  { id: "en_US-libritts_r-medium", label: "Miles (US male, expressive)", hint: { lang: "en-US", gender: "male" } },
 ];
+
+// Resolve the voice field for a given engine. Piper wants the ID string; Web
+// Speech wants either a specific system voiceURI (character.webVoice, if the
+// user picked one) or the { lang, gender } hint derived from the Piper voice id.
+export function voiceForEngine(character, engine) {
+  if (engine === "webspeech") {
+    if (character.webVoice) return character.webVoice; // user-picked system voice
+    const v = VOICES.find((x) => x.id === character.voice);
+    return v?.hint || { lang: "en", gender: undefined };
+  }
+  return character.voice; // piper
+}
+
+// Build a sorted list of Web Speech system voices suitable for a <select>.
+// Re-reads live each call (no caching) so the UI updates when voices arrive
+// async via the voiceschanged event — getVoices() returns [] until then.
+export function webSpeechVoiceOptions() {
+  if (!("speechSynthesis" in window)) return [];
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices.length) return [];
+  const english = voices
+    .filter((v) => v.lang.toLowerCase().startsWith("en"))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return (english.length ? english : voices).map((v) => ({
+    id: v.voiceURI,
+    label: `${v.name} (${v.lang})`,
+  }));
+}
 
 export const PRESET_CHARACTERS = [
   {

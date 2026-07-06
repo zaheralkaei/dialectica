@@ -1,14 +1,23 @@
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useEffect } from "react";
 import { MODELS, DEFAULT_MODEL, getEngine, streamTurn, isWebGPUAvailable } from "./lib/llm.js";
 import { buildTurnPrompt } from "./lib/debate.js";
 import { TTSBackend } from "./lib/tts.js";
+import { WebSpeechTTS } from "./lib/webSpeechTts.js";
 import { log } from "./lib/logger.js";
-import { PRESET_CHARACTERS, VOICES, makeCharacter } from "./config/characters.js";
+import { PRESET_CHARACTERS, VOICES, makeCharacter, voiceForEngine, webSpeechVoiceOptions } from "./config/characters.js";
 import { PRESET_TOPICS, randomTopic } from "./config/topics.js";
 import DebaterCard from "./components/DebaterCard.jsx";
 import Transcript from "./components/Transcript.jsx";
 
 const PHASES = { SETUP: "setup", LOADING: "loading", DEBATING: "debating", DONE: "done" };
+
+// TTS engines. "webspeech" is the default — zero download, instant, uses the
+// browser's built-in speechSynthesis. "piper" is the neural VITS engine
+// (~20–60 MB per voice download) for higher-quality streaming voices.
+const TTS_ENGINES = [
+  { id: "webspeech", label: "Web Speech (light, no download)" },
+  { id: "piper", label: "Piper neural (~40 MB voices)" },
+];
 
 // Most transcript bubbles kept on screen at once (indefinite debates would
 // otherwise grow the DOM forever).
@@ -21,6 +30,7 @@ let debateActive = false;
 export default function App() {
   const [phase, setPhase] = useState(PHASES.SETUP);
   const [model, setModel] = useState(DEFAULT_MODEL);
+  const [ttsEngine, setTtsEngine] = useState("webspeech");
   const [topic, setTopic] = useState(PRESET_TOPICS[0]);
   const [turns, setTurns] = useState(6);
   const [infinite, setInfinite] = useState(false);
@@ -43,6 +53,19 @@ export default function App() {
 
   const webgpu = isWebGPUAvailable();
 
+  // Web Speech system voices load async (getVoices() returns [] until the
+  // voiceschanged event fires). Bump a counter to re-render the voice dropdowns
+  // when they arrive so the user can pick a specific system voice.
+  const [, setVoicesTick] = useState(0);
+  useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+    const bump = () => setVoicesTick((n) => n + 1);
+    window.speechSynthesis.addEventListener("voiceschanged", bump);
+    // Some browsers populate voices without firing the event — bump once.
+    if (window.speechSynthesis.getVoices().length > 0) bump();
+    return () => window.speechSynthesis.removeEventListener("voiceschanged", bump);
+  }, []);
+
   const appendEntry = useCallback((speaker, char) => {
     const id = ++idRef.current;
     // Cap the rendered transcript so an indefinite debate can't grow the DOM
@@ -60,6 +83,11 @@ export default function App() {
   }, []);
 
   async function ensureTTS() {
+    if (ttsEngine === "webspeech") {
+      setStatus("Loading Web Speech voices…");
+      log("TTS", "Loading Web Speech (no download needed)");
+      return WebSpeechTTS.load({ audioCtx: audioCtxRef.current });
+    }
     setStatus("Loading Piper voices…");
     log("TTS", `Loading Piper voices: ${charA.voice}, ${charB.voice}…`);
     // Piper (VITS) is a much lighter neural TTS than Kokoro — it runs on the CPU
@@ -168,7 +196,7 @@ export default function App() {
         isOpening: turnIndex < 2,
       });
 
-      const prep = tts.prepareTurn({ voice: character.voice, label });
+      const prep = tts.prepareTurn({ voice: voiceForEngine(character, ttsEngine), label });
       prefetchRef.current = prep;
 
       log("LLM", `${label}: generating…`);
@@ -296,6 +324,8 @@ export default function App() {
           onChange={setCharA}
           presets={PRESET_CHARACTERS}
           voices={VOICES}
+          ttsEngine={ttsEngine}
+          webVoices={webSpeechVoiceOptions}
           active={activeSpeaker === "A"}
           disabled={busy}
         />
@@ -309,6 +339,8 @@ export default function App() {
           onChange={setCharB}
           presets={PRESET_CHARACTERS}
           voices={VOICES}
+          ttsEngine={ttsEngine}
+          webVoices={webSpeechVoiceOptions}
           active={activeSpeaker === "B"}
           disabled={busy}
         />
@@ -350,6 +382,17 @@ export default function App() {
               {MODELS.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field">
+            <span>Voice engine</span>
+            <select value={ttsEngine} disabled={busy} onChange={(e) => setTtsEngine(e.target.value)}>
+              {TTS_ENGINES.map((e) => (
+                <option key={e.id} value={e.id}>
+                  {e.label}
                 </option>
               ))}
             </select>

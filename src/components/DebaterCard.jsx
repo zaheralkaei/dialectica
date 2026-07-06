@@ -9,6 +9,8 @@ export default function DebaterCard({
   onChange,
   presets,
   voices,
+  ttsEngine = "piper",
+  webVoices,
   active,
   disabled,
 }) {
@@ -23,6 +25,21 @@ export default function DebaterCard({
   };
 
   const set = (patch) => onChange({ ...character, ...patch });
+
+  // Voice dropdown options depend on the active TTS engine. For Web Speech we
+  // show the browser's system voices (the character.voice field still holds the
+  // Piper id, used to derive a gender hint — but the user can override with any
+  // system voice by selecting one, which we store as webVoice).
+  const voiceOptions = ttsEngine === "webspeech" ? webVoices?.() || [] : voices;
+  const voiceValue = ttsEngine === "webspeech" ? character.webVoice || "" : character.voice;
+
+  const onVoiceChange = (e) => {
+    if (ttsEngine === "webspeech") {
+      set({ webVoice: e.target.value });
+    } else {
+      set({ voice: e.target.value });
+    }
+  };
 
   return (
     <div
@@ -73,13 +90,16 @@ export default function DebaterCard({
       </label>
 
       <label className="field">
-        <span>Voice</span>
+        <span>Voice {ttsEngine === "webspeech" && voiceOptions.length === 0 ? "(system voices loading…)" : ""}</span>
         <select
           disabled={disabled}
-          value={character.voice}
-          onChange={(e) => set({ voice: e.target.value })}
+          value={voiceValue}
+          onChange={onVoiceChange}
         >
-          {voices.map((v) => (
+          {ttsEngine === "webspeech" && (
+            <option value="">Auto (match persona gender)</option>
+          )}
+          {voiceOptions.map((v) => (
             <option key={v.id} value={v.id}>
               {v.label}
             </option>

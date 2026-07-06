@@ -7,8 +7,8 @@ No backend, no API keys, no server costs. Deploys as a static site to Netlify.
 
 - **LLM**: [WebLLM](https://webllm.mlc.ai/) runs a small instruction model (default **Llama 3.2 3B**) on **WebGPU**, fully on-device. One engine is reused for both debaters — turns are sequential, so a second model load would just waste VRAM. The system prompt is swapped each turn to switch personas.
 - **TTS (streaming)**: two interchangeable backends
-  - **Web Speech API** — built into the browser, zero download, instant. Streaming LLM tokens are chunked into sentences so speech starts almost immediately.
-  - **[Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX)** — neural TTS (~80–300 MB), true token-level streaming via `TextSplitterStream`, played through the Web Audio API. Runs on WebGPU (falls back to WASM).
+  - **Web Speech API** — built into the browser, zero download, instant. **Default.** Streaming LLM tokens are chunked into sentences so speech starts almost immediately. System voices vary by OS/browser; the persona's gender hint auto-matches an appropriate voice.
+  - **[Piper (VITS)](https://github.com/rhasspy/piper)** via `@diffusionstudio/vits-web` — neural TTS (~20–60 MB per voice), runs on CPU (multi-threaded onnxruntime via cross-origin isolation), so the GPU stays entirely with WebLLM. Higher-quality voices, opt-in via the **Voice engine** dropdown.
 - **Overlap**: while debater A is *speaking*, debater B's next turn is already being *generated*, keeping the back-and-forth snappy.
 - Models download once and are cached in the browser (IndexedDB / Cache API) forever after.
 
@@ -41,8 +41,8 @@ npx netlify deploy --prod --dir dist
 - **WebGPU** is required for the on-device LLM — latest Chrome/Edge (desktop), or Chrome on Android with the flag. Safari's WebGPU is still maturing.
 - First debate downloads the model (a few hundred MB → ~2 GB depending on the model chosen). Subsequent visits are instant.
 - Smaller models (Qwen2.5 1.5B, Llama 3.2 1B) load faster but debate less sharply — pick from the **Model** dropdown.
-- If Kokoro download fails, it's almost always a network/CDN hiccup — the Web Speech engine always works as a fallback.
+- If Piper download fails, it's almost always a network/CDN hiccup — the Web Speech engine always works as a fallback (and is the default).
 
 ## Stack
 
-Vite · React · `@mlc-ai/web-llm` · `kokoro-js` · Web Speech API · Web Audio API
+Vite · React · `@mlc-ai/web-llm` · `@diffusionstudio/vits-web` (Piper) · Web Speech API · Web Audio API
