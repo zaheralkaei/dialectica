@@ -466,7 +466,10 @@ export default function App() {
       <footer className="foot">
         Runs 100% in your browser · No backend · No API keys · Models cached after first load
         <br />
-        Designed and implemented by Zaher Alkaei
+        Designed and implemented by{" "}
+        <a href="https://github.com/zaheralkaei" target="_blank" rel="noopener noreferrer" className="author-link">
+          Zaher Alkaei
+        </a>
       </footer>
 
       {showInfo && (
@@ -511,7 +514,10 @@ export default function App() {
               expressed are not those of the author.
             </p>
             <p className="credit">
-              Designed and implemented by Zaher Alkaei
+              Designed and implemented by{" "}
+              <a href="https://github.com/zaheralkaei" target="_blank" rel="noopener noreferrer" className="author-link">
+                Zaher Alkaei
+              </a>
             </p>
           </div>
         </div>
