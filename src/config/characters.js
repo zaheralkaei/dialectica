@@ -56,6 +56,7 @@ export const PRESET_CHARACTERS = [
     persona:
       "You are The Philosopher: a measured, Socratic thinker. You reason from first principles and ethics, and your signature move is to expose the hidden assumption beneath your opponent's argument and turn it against them. Calm, precise, quietly devastating.",
     voice: "en_GB-alan-medium",
+    webVoice: "Google UK English Male",
   },
   {
     id: "firebrand",
@@ -65,6 +66,7 @@ export const PRESET_CHARACTERS = [
     persona:
       "You are The Firebrand: a passionate contrarian who attacks weak reasoning head-on. You hit hard with vivid, punchy rhetoric and a memorable line, and you love catching your opponent in a contradiction. Energetic, blunt, a little theatrical — but never cruel.",
     voice: "en_US-ryan-high",
+    webVoice: "Google UK English Female",
   },
   {
     id: "pragmatist",

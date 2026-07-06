@@ -34,6 +34,12 @@ body {
   text-align: center;
   margin-bottom: 24px;
 }
+.hero-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
 .hero h1 {
   font-size: 2.6rem;
   margin: 0;
@@ -42,6 +48,25 @@ body {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+}
+.info-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 1.05rem;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.info-btn:hover {
+  color: var(--text);
+  border-color: var(--primary);
+  background: var(--bg-2);
 }
 .tagline {
   color: var(--muted);
@@ -360,6 +385,102 @@ button:disabled {
 @keyframes rise {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+/* Modal (info) */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(3px);
+  display: grid;
+  place-items: center;
+  z-index: 1000;
+  padding: 20px;
+  animation: rise 0.2s ease;
+}
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px 30px;
+  max-width: 560px;
+  width: 100%;
+  max-height: 80vh;
+  overflow-y: auto;
+  position: relative;
+  box-shadow: 0 20px 60px -10px rgba(0, 0, 0, 0.5);
+}
+.modal h2 {
+  margin: 0 0 14px;
+  font-size: 1.4rem;
+  background: linear-gradient(90deg, #8b7fd6, #6c7ae0, #5aa9e6);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.modal h3 {
+  margin: 18px 0 8px;
+  font-size: 1.05rem;
+  color: var(--text);
+}
+.modal p {
+  margin: 0 0 12px;
+  line-height: 1.6;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+.modal p strong,
+.modal li strong {
+  color: var(--text);
+}
+.modal ul {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  color: var(--muted);
+}
+.modal li {
+  margin-bottom: 10px;
+  line-height: 1.55;
+  font-size: 0.9rem;
+}
+.modal-close {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+.modal-close:hover {
+  color: var(--text);
+  border-color: var(--danger);
+}
+.disclaimer {
+  background: #3a2f1a;
+  border: 1px solid #6b5525;
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 0.86rem;
+  line-height: 1.6;
+  color: #f0d9a0;
+}
+.disclaimer strong {
+  color: #f5c97a;
+}
+.credit {
+  text-align: center;
+  font-weight: 700;
+  color: var(--text);
+  margin-top: 16px;
+  font-size: 0.9rem;
 }
 
 @media (max-width: 760px) {
