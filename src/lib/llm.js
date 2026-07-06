@@ -41,11 +41,14 @@ export async function* streamTurn(
   engine,
   systemPrompt,
   userPrompt,
-  // Hard cap on turn length. The prompt asks for ~60 words; this ceiling
-  // (~90 words) stops the model rambling into 150+ word turns, which is the
-  // single biggest speed win — shorter turns are faster to both generate AND
-  // synthesize, and keep the pipeline from falling behind.
-  { temperature = 0.85, max_tokens = 120 } = {}
+  // Hard cap on turn length. The prompt asks for ~60 words, but LLMs aren't
+  // precise about word counts and regularly run to 80-100. A token ceiling too
+  // close to the target cuts the model off mid-sentence (120 tokens ≈ 90 words
+  // was too tight). 200 tokens (≈150 words) gives enough headroom to finish the
+  // sentence while still preventing true 200+ word rambles — which are the
+  // single biggest speed hit, since longer turns are slower to both generate
+  // AND synthesize, and make the pipeline fall behind.
+  { temperature = 0.85, max_tokens = 200 } = {}
 ) {
   const chunks = await engine.chat.completions.create({
     messages: [
