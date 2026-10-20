@@ -1,8 +1,21 @@
 import { useRef, useState, useCallback, useEffect } from "react";
-import { MODELS, DEFAULT_MODEL, getEngine, streamTurn, isWebGPUAvailable } from "./lib/llm.js";
-import { buildTurnPrompt } from "./lib/debate.js";
+import {
+  MODELS,
+  CPU_MODEL_ID,
+  StallError,
+  detectGPU,
+  defaultModel,
+  isConstrainedDevice,
+  prefetchEngineModule,
+  loadEngine,
+  disposeEngine,
+  isFatalEngineError,
+  streamTurn,
+} from "./lib/llm.js";
+import { buildTurnPrompt, isEcho, NO_ECHO_RETRY } from "./lib/debate.js";
+import { createSpeechFilter, dropIncompleteTail } from "./lib/speechFilter.js";
 import { TTSBackend } from "./lib/tts.js";
-import { WebSpeechTTS } from "./lib/webSpeechTts.js";
+import { WebSpeechTTS, unlockSpeech } from "./lib/webSpeechTts.js";
 import { log } from "./lib/logger.js";
 import { PRESET_CHARACTERS, VOICES, makeCharacter, voiceForEngine, webSpeechVoiceOptions } from "./config/characters.js";
 import { PRESET_TOPICS, randomTopic } from "./config/topics.js";
@@ -13,23 +26,71 @@ const PHASES = { SETUP: "setup", LOADING: "loading", DEBATING: "debating", DONE:
 
 // TTS engines. "webspeech" is the default — zero download, instant, uses the
 // browser's built-in speechSynthesis. "piper" is the neural VITS engine
-// (~20–60 MB per voice download) for higher-quality streaming voices.
+// (~20–60 MB per voice download) for higher-quality voices.
 const TTS_ENGINES = [
   { id: "webspeech", label: "Web Speech (light, no download)" },
   { id: "piper", label: "Piper neural (~40 MB voices)" },
 ];
 
-// Most transcript bubbles kept on screen at once (indefinite debates would
-// otherwise grow the DOM forever).
+// Most transcript bubbles kept on screen (an indefinite debate would otherwise
+// grow the DOM forever).
 const MAX_BUBBLES = 40;
 
-// Module-level guard so a second debate can never run concurrently with one
-// already in flight (a component-ref guard could be defeated by a remount).
-let debateActive = false;
+// How much of a turn is held back (not spoken yet) until it's confirmed not to
+// be a copy of the previous turn — about a dozen words.
+const ECHO_CHECK_CHARS = 70;
+
+// --- run control -------------------------------------------------------------
+// Every debate run gets its own token. Stop aborts THAT run: each await in the
+// run races against its abort signal, so the loop exits immediately instead of
+// finishing whatever it was waiting on. Previously one shared `running` flag
+// was used for all runs, so after Stop → Start the old loop saw "running" again
+// and kept playing over the new debate (and its cleanup could kill the new one).
+
+class Aborted extends Error {
+  constructor() {
+    super("aborted");
+    this.name = "Aborted";
+  }
+}
+
+let runSeq = 0;
+function createRun() {
+  const run = { id: ++runSeq, aborted: false, finished: false };
+  run.abortP = new Promise((resolve) => (run._fire = resolve));
+  run.doneP = new Promise((resolve) => (run.markDone = resolve));
+  run.abort = () => {
+    if (run.aborted) return;
+    run.aborted = true;
+    run._fire();
+  };
+  return run;
+}
+
+// Await `p`, but bail out the instant the run is stopped.
+async function until(run, p) {
+  const value = await Promise.race([p, run.abortP]);
+  if (run.aborted) throw new Aborted();
+  return value;
+}
+
+function friendlyError(e) {
+  const msg = String(e?.message || e);
+  if (/device (was )?lost|instance reference|out of memory|\boom\b/i.test(msg))
+    return "The GPU ran out of memory and the model stopped. Pick a smaller model (e.g. Llama 3.2 1B), close other heavy tabs, then press Continue.";
+  if (e instanceof StallError)
+    return "The model stopped responding. Press Continue to retry — or pick a smaller model if it keeps happening.";
+  if (/shader-f16/i.test(msg)) return "Your GPU can't run this model build. Please pick another model.";
+  if (/quota|storage/i.test(msg))
+    return "The browser ran out of storage for the model cache. Free up some disk space or site data, then try again.";
+  if (/fetch|network|load failed|connection/i.test(msg)) return "A download failed — check your connection and try again.";
+  return msg;
+}
 
 export default function App() {
   const [phase, setPhase] = useState(PHASES.SETUP);
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [gpu, setGpu] = useState({ checked: false, webgpu: false, f16: false });
+  const [model, setModel] = useState(null); // chosen after the GPU check
   const [ttsEngine, setTtsEngine] = useState("webspeech");
   const [topic, setTopic] = useState(PRESET_TOPICS[0]);
   const [turns, setTurns] = useState(6);
@@ -39,38 +100,77 @@ export default function App() {
 
   const [transcript, setTranscript] = useState([]);
   const [status, setStatus] = useState("");
+  const [voiceStatus, setVoiceStatus] = useState("");
   const [progress, setProgress] = useState(0);
   const [activeSpeaker, setActiveSpeaker] = useState(null); // "A" | "B" | null
   const [error, setError] = useState("");
   const [showInfo, setShowInfo] = useState(false);
 
-  const runningRef = useRef(false);
-  const ttsRef = useRef(null);
-  const audioCtxRef = useRef(null);
+  const runRef = useRef(null); // the current (or last) debate run
+  const engineRef = useRef(null);
+  const ttsRef = useRef(null); // TTS backend used by the current run
+  const ttsCacheRef = useRef({}); // backends reused across runs (no worker leak)
   const sessionRef = useRef(null); // the turn currently PLAYING
   const prefetchRef = useRef(null); // the next turn being PREPARED silently
-  const engineRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const committedRef = useRef([]); // turns already shown — lets Continue resume
+  const nextTurnRef = useRef(0);
+  const wakeLockRef = useRef(null);
   const idRef = useRef(0);
 
-  const webgpu = isWebGPUAvailable();
+  const isRunning = () => {
+    const r = runRef.current;
+    return !!r && !r.finished && !r.aborted;
+  };
 
-  // Web Speech system voices load async (getVoices() returns [] until the
-  // voiceschanged event fires). Bump a counter to re-render the voice dropdowns
-  // when they arrive so the user can pick a specific system voice.
+  // Probe the GPU once: decides WebGPU vs Lite CPU, f16 vs f32 model builds,
+  // and a model size that fits the device.
+  useEffect(() => {
+    let alive = true;
+    detectGPU().then((g) => {
+      if (!alive) return;
+      setGpu({ checked: true, ...g });
+      setModel((m) => m ?? defaultModel(g));
+      log(
+        "DEBATE",
+        `Device: ${g.webgpu ? `WebGPU${g.f16 ? "" : " without shader-f16 (using f32 model builds)"}` : "no WebGPU → Lite CPU mode"}` +
+          (isConstrainedDevice() ? " · mobile / low-memory profile" : "")
+      );
+      if (g.webgpu) {
+        const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 1500));
+        idle(() => prefetchEngineModule());
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Web Speech system voices load async; re-render the dropdowns when they arrive.
   const [, setVoicesTick] = useState(0);
   useEffect(() => {
     if (!("speechSynthesis" in window)) return;
     const bump = () => setVoicesTick((n) => n + 1);
-    window.speechSynthesis.addEventListener("voiceschanged", bump);
-    // Some browsers populate voices without firing the event — bump once.
+    window.speechSynthesis.addEventListener?.("voiceschanged", bump);
     if (window.speechSynthesis.getVoices().length > 0) bump();
-    return () => window.speechSynthesis.removeEventListener("voiceschanged", bump);
+    return () => window.speechSynthesis.removeEventListener?.("voiceschanged", bump);
+  }, []);
+
+  // Coming back to the tab mid-debate: re-take the wake lock (the browser drops
+  // it when the page is hidden) and resume audio if the OS interrupted it.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState !== "visible" || !isRunning()) return;
+      acquireWakeLock();
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state !== "running") ctx.resume?.().catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   const appendEntry = useCallback((speaker, char) => {
     const id = ++idRef.current;
-    // Cap the rendered transcript so an indefinite debate can't grow the DOM
-    // without bound — older bubbles scroll off and are dropped.
     setTranscript((t) =>
       [...t, { id, speaker, speakerName: char.name, emoji: char.emoji, color: char.color, text: "" }].slice(
         -MAX_BUBBLES
@@ -83,231 +183,408 @@ export default function App() {
     setTranscript((t) => t.map((e) => (e.id === id ? { ...e, text } : e)));
   }, []);
 
-  async function ensureTTS() {
-    if (ttsEngine === "webspeech") {
-      setStatus("Loading Web Speech voices…");
-      log("TTS", "Loading Web Speech (no download needed)");
-      return WebSpeechTTS.load({ audioCtx: audioCtxRef.current });
-    }
-    setStatus("Loading Piper voices…");
-    log("TTS", `Loading Piper voices: ${charA.voice}, ${charB.voice}…`);
-    // Piper (VITS) is a much lighter neural TTS than Kokoro — it runs on the CPU
-    // (multi-threaded onnxruntime via the cross-origin isolation headers), so the
-    // GPU stays entirely with WebLLM. We pre-download just the two debaters'
-    // voices so nothing stalls mid-debate fetching a model.
-    return TTSBackend.load({
-      voices: [charA.voice, charB.voice],
-      audioCtx: audioCtxRef.current,
-      onProgress: (p) => {
-        if (p?.progress != null) setProgress(Math.round(p.progress));
-        if (p?.status) setStatus(`Piper: ${p.file || p.status} ${p.progress ? Math.round(p.progress) + "%" : ""}`);
-      },
-    });
-  }
+  const dropEmptyEntries = useCallback(() => setTranscript((t) => t.filter((e) => e.text)), []);
 
-  async function start() {
-    // Re-entrancy guard: never let a second debate loop run while one is already
-    // in flight, or two loops would generate and PLAY over each other.
-    if (debateActive) return;
-    debateActive = true;
-    runningRef.current = true;
-
-    // Unlock audio NOW, synchronously inside the click handler. Browsers only
-    // let an AudioContext produce sound after a user gesture; if we waited until
-    // the first turn is synthesized (many seconds later, after model downloads)
-    // the gesture is long gone and playback stays silent. Creating + resuming it
-    // here — still within the click — guarantees it's running when audio starts.
+  // Must run synchronously inside the click: browsers only allow audio after a
+  // user gesture, and our first sound comes seconds later.
+  function unlockAudio() {
     try {
-      if (!audioCtxRef.current) {
-        audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      if (audioCtxRef.current.state === "suspended") audioCtxRef.current.resume();
+      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtxRef.current.state !== "running") audioCtxRef.current.resume()?.catch?.(() => {});
     } catch {}
+  }
 
-    setError("");
-    if (!webgpu) {
-      debateActive = false;
-      runningRef.current = false;
-      setError(
-        "WebGPU isn't available in this browser. Use the latest Chrome or Edge (desktop) — the on-device LLM needs WebGPU."
-      );
-      return;
-    }
-    setTranscript([]);
-    setPhase(PHASES.LOADING);
-    log(
-      "DEBATE",
-      `Start · "${topic}" · ${model} · ${infinite ? "∞" : turns} turns · ${charA.name} vs ${charB.name}`
-    );
-
+  // Keep a phone's screen on during a debate — when it sleeps, the browser
+  // suspends audio and the GPU and the debate stalls.
+  async function acquireWakeLock() {
+    if (!navigator.wakeLock || wakeLockRef.current) return;
     try {
-      setStatus("Loading debate model… first time downloads a few hundred MB, then it's cached.");
-      log("LLM", `Loading model ${model}…`);
-      const engine = await getEngine(model, (r) => {
-        setStatus(r.text || "Loading model…");
-        if (r.progress != null) setProgress(Math.round(r.progress * 100));
+      const lock = await navigator.wakeLock.request("screen");
+      wakeLockRef.current = lock;
+      lock.addEventListener?.("release", () => {
+        if (wakeLockRef.current === lock) wakeLockRef.current = null;
       });
-      engineRef.current = engine;
-      log("LLM", "Model ready");
-
-      ttsRef.current = await ensureTTS();
-
-      setPhase(PHASES.DEBATING);
-      setStatus("");
-      log("DEBATE", "Everything loaded — debate begins");
-      await runLoop(engine);
-      setStatus("Debate complete.");
-      setPhase(PHASES.DONE);
-      log("DEBATE", "Complete");
-    } catch (e) {
-      console.error(e);
-      log("WARN", `Debate aborted: ${String(e?.message || e)}`);
-      setError(String(e?.message || e));
-      setPhase(PHASES.SETUP);
-    } finally {
-      debateActive = false;
-      runningRef.current = false;
-      setActiveSpeaker(null);
-    }
+    } catch {}
+  }
+  function releaseWakeLock() {
+    const lock = wakeLockRef.current;
+    wakeLockRef.current = null;
+    lock?.release?.().catch?.(() => {});
   }
 
-  // Pipelined debate:
-  //   • Each turn's audio is synthesized WHILE the LLM is still writing it
-  //     (KokoroPreparedTurn.push feeds the worker per sentence).
-  //   • While a debater is SPEAKING, the next debater's turn is already being
-  //     generated + synthesized in the background — but nothing is printed and
-  //     nothing is spoken until it's actually their turn.
-  async function runLoop(engine) {
-    const tts = ttsRef.current;
-    const totalTurns = infinite ? Infinity : turns;
-    const local = []; // running transcript used to build each prompt
-
-    // Generate + synthesize one turn without displaying or playing it.
-    // Returns everything needed to present it later.
-    async function prepareTurn(turnIndex) {
-      const isA = turnIndex % 2 === 0;
-      const character = isA ? charA : charB;
-      const opponent = isA ? charB : charA;
-      const label = `Turn ${turnIndex + 1} (${isA ? "A" : "B"} · ${character.name})`;
-      const { system, user } = buildTurnPrompt({
-        character,
-        opponent,
-        topic,
-        transcript: local,
-        isOpening: turnIndex < 2,
-      });
-
-      const prep = tts.prepareTurn({ voice: voiceForEngine(character, ttsEngine), label });
-      prefetchRef.current = prep;
-
-      log("LLM", `${label}: generating…`);
-      const genStart = performance.now();
-      let text = "";
-      let firstToken = false;
-      for await (const delta of streamTurn(engine, system, user)) {
-        if (!runningRef.current) break;
-        if (!firstToken) {
-          firstToken = true;
-          log("LLM", `${label}: first token (${Math.round(performance.now() - genStart)}ms)`);
-        }
-        text += delta;
-        prep.push(delta); // synth starts now, during generation
-      }
-      prep.finishInput();
-      const words = text.trim().split(/\s+/).filter(Boolean).length;
-      log("LLM", `${label}: finished — ${words} words in ${Math.round(performance.now() - genStart)}ms`);
-      // Record into context so the NEXT prepared turn can rebut it. Only the last
-      // few are ever used (see HISTORY_WINDOW), so trim to keep memory flat over
-      // an indefinite debate.
-      local.push({ speakerName: character.name, text });
-      if (local.length > 6) local.splice(0, local.length - 6);
-      // Deliberately DON'T wait for full synthesis here. A turn is "ready" the
-      // moment its text is generated; its audio segments keep synthesizing in
-      // the background and play() streams them in as it reaches them. Waiting
-      // for the whole turn to synthesize is what caused the "Preparing next
-      // turn…" stall: synth of a full turn can outlast the previous turn's
-      // playback. Generation alone always finishes well within that playback,
-      // so returning now keeps the hand-off seamless — and for every turn after
-      // the opening the segments have had the entire previous turn to finish, so
-      // playback is still gapless.
-      return { turnIndex, speaker: isA ? "A" : "B", character, prep };
-    }
-
-    // Start preparing the very first turn. Only the opening incurs a visible
-    // wait (for its text + first audio segment); every later turn is prepared in
-    // the background while the previous debater is speaking.
-    setStatus("Preparing opening statement (generating + synthesizing voice)…");
-    let pending = prepareTurn(0);
-
-    for (let turn = 0; turn < totalTurns; turn++) {
-      // While we wait for this turn to be ready, nobody is speaking — clear the
-      // glow so it never lingers on a debater who has gone silent. If the turn
-      // is already prepared (the common case), this "wait" is instant.
-      if (turn > 0) {
-        setActiveSpeaker(null);
-        setStatus("Preparing next turn…");
-      }
-      const waitStart = performance.now();
-      const cur = await pending; // its text + audio are ready
-      if (!runningRef.current) break;
-      const waitMs = Math.round(performance.now() - waitStart);
-      if (turn > 0 && waitMs > 150) {
-        log("DEBATE", `waited ${waitMs}ms for Turn ${turn + 1} to be ready (pipeline behind)`);
-      }
-
-      // Kick off the NEXT turn now, so it prepares while this one speaks.
-      if (turn + 1 < totalTurns) {
-        log("DEBATE", `prefetching Turn ${turn + 2} in the background`);
-        pending = prepareTurn(turn + 1);
-      }
-
-      // Present the current turn: reveal its bubble and play its voice. The glow
-      // is on ONLY for the duration of play() — i.e. only while audio is heard.
-      setStatus("");
-      setActiveSpeaker(cur.speaker);
-      const entryId = appendEntry(cur.speaker, cur.character);
-      sessionRef.current = cur.prep;
-
-      // play() reveals each segment's text as its audio begins.
-      await cur.prep.play((revealed) => updateEntry(entryId, revealed));
-      if (!runningRef.current) break;
-    }
-  }
-
-  function stop() {
-    if (runningRef.current) log("DEBATE", "Stop requested — interrupting generation & audio");
-    debateActive = false;
-    runningRef.current = false;
-    // Breaking the for-await does NOT stop WebLLM's decode loop — we must
-    // explicitly interrupt it, or the engine stays busy and the next debate
-    // queues behind a request that never ends.
+  // Silence everything right now: stop token generation, cancel the playing and
+  // prefetched turns, drop queued synthesis, and suspend audio output.
+  function haltAudio() {
     try {
       engineRef.current?.interruptGenerate();
     } catch {}
     sessionRef.current?.cancel();
     prefetchRef.current?.cancel();
-    ttsRef.current?.cancel();
-    setActiveSpeaker(null);
-    setStatus("Stopped.");
-    setPhase(PHASES.DONE);
+    ttsRef.current?.cancelAll?.();
+    try {
+      if (audioCtxRef.current?.state === "running") audioCtxRef.current.suspend()?.catch?.(() => {});
+    } catch {}
   }
 
-  function reset() {
-    stop();
-    setTranscript([]);
-    setPhase(PHASES.SETUP);
+  async function ensureTTS() {
+    const cache = ttsCacheRef.current;
+    if (ttsEngine === "webspeech") {
+      log("TTS", "Using Web Speech (no download needed)");
+      if (!cache.webspeech) cache.webspeech = WebSpeechTTS.load();
+      return cache.webspeech;
+    }
+    const voices = [charA.voice, charB.voice];
+    log("TTS", `Preparing Piper voices: ${voices.join(", ")}…`);
+    const run = runRef.current;
+    const onProgress = (p) => {
+      if (runRef.current !== run || run?.aborted) return;
+      if (p?.progress != null) setVoiceStatus(`Downloading voice ${p.file || ""} — ${Math.round(p.progress)}%`);
+    };
+    // One Piper worker for the whole session: it keeps its voices and warm
+    // onnxruntime, so later debates start instantly.
+    if (!cache.piper) {
+      const pending = TTSBackend.load({ voices, audioCtx: audioCtxRef.current, onProgress });
+      cache.piper = pending;
+      pending.catch(() => {
+        if (cache.piper === pending) cache.piper = null;
+      });
+      return pending;
+    }
+    const backend = await cache.piper;
+    await backend.prepareVoices(voices, onProgress);
+    return backend;
+  }
+
+  async function start(resume = false) {
+    // ---- synchronous part: still inside the click ----
+    if (isRunning() || !model) return;
+    const topicText = topic.trim();
+    if (!topicText) {
+      setError("Type or pick a topic first.");
+      return;
+    }
+    unlockAudio();
+    if (ttsEngine === "webspeech") unlockSpeech();
+
+    const prev = runRef.current;
+    const run = createRun();
+    runRef.current = run;
+    if (resume) {
+      // Pick up right after the last turn that was actually heard.
+      const heard = committedRef.current.filter((r) => r.heard);
+      committedRef.current = heard;
+      nextTurnRef.current = heard.length ? heard[heard.length - 1].turn + 1 : 0;
+    } else {
+      setTranscript([]);
+      committedRef.current = [];
+      nextTurnRef.current = 0;
+    }
+    setError("");
     setStatus("");
+    setVoiceStatus("");
+    setProgress(0);
+    setActiveSpeaker(null);
+    setPhase(PHASES.LOADING);
+    acquireWakeLock();
+
+    try {
+      // A run that was just stopped may still be unwinding; let it finish so the
+      // two can never overlap.
+      if (prev && !prev.finished) await until(run, prev.doneP);
+
+      log(
+        "DEBATE",
+        `${resume ? "Continue" : "Start"} · "${topicText}" · ${model} · ${infinite ? "∞" : turns} turns · ${charA.name} vs ${charB.name}`
+      );
+      setStatus("Loading the debate model… the first time downloads it, then it's cached.");
+      log("LLM", `Loading model ${model}…`);
+      // Model and voices load in parallel — the old code waited for one, then the other.
+      // Progress only updates the UI while THIS run is the one loading — a load
+      // that outlives a stopped run must not overwrite "Stopped." on screen.
+      const enginePromise = loadEngine(model, gpu, (r) => {
+        if (runRef.current !== run || run.aborted) return;
+        if (r?.text) setStatus(r.text);
+        if (r?.progress != null) setProgress(Math.round(r.progress * 100));
+      });
+      const ttsPromise = ensureTTS();
+      let ttsReady = false;
+      ttsPromise.then(() => (ttsReady = true), () => {});
+      // Report each half as it finishes, so the status reflects what is
+      // actually still loading (often the voices, not the model).
+      enginePromise.then(
+        () => {
+          if (runRef.current !== run || run.aborted) return;
+          log("LLM", "Model ready");
+          if (!ttsReady) {
+            setProgress(100);
+            setStatus("Model ready — preparing the voices…");
+          }
+        },
+        () => {}
+      );
+      const [engine, tts] = await until(run, Promise.all([enginePromise, ttsPromise]));
+      engineRef.current = engine;
+      ttsRef.current = tts;
+
+      setPhase(PHASES.DEBATING);
+      setStatus("");
+      setVoiceStatus("");
+      log("DEBATE", "Everything loaded — debate begins");
+      const completed = await runLoop(run, engine, tts, topicText);
+      if (runRef.current === run) {
+        setStatus(completed ? "Debate complete." : "");
+        setPhase(PHASES.DONE);
+        log("DEBATE", "Complete");
+      }
+    } catch (e) {
+      if (e instanceof Aborted || run.aborted) return; // stop() already updated the UI
+      console.error(e);
+      log("WARN", `Debate aborted: ${String(e?.message || e)}`);
+      haltAudio();
+      if (isFatalEngineError(e)) {
+        // The engine can't be trusted after a device loss or stall — rebuild it
+        // on the next Start instead of reusing a dead one.
+        engineRef.current = null;
+        disposeEngine();
+      }
+      if (runRef.current === run) {
+        dropEmptyEntries();
+        setError(friendlyError(e));
+        setStatus("");
+        setPhase(PHASES.DONE);
+      }
+    } finally {
+      run.finished = true;
+      run.markDone();
+      if (runRef.current === run) {
+        setActiveSpeaker(null);
+        releaseWakeLock();
+      }
+    }
+  }
+
+  // Pipelined debate:
+  //   • A turn starts SPEAKING as soon as its first sentence/segment is ready,
+  //     while the LLM is still writing the rest.
+  //   • Once a turn's text is complete, the next debater's turn starts
+  //     generating in the background, while the current one is still talking.
+  async function runLoop(run, engine, tts, topicText) {
+    const startTurn = nextTurnRef.current;
+    const endTurn = infinite ? Infinity : startTurn + turns;
+    // Working memory for prompts (only the last two turns are ever used).
+    const history = committedRef.current.slice(-6).map(({ speakerName, text }) => ({ speakerName, text }));
+    const [voiceA, voiceB] = tts.cast([voiceForEngine(charA, ttsEngine), voiceForEngine(charB, ttsEngine)]);
+    let emptyStreak = 0;
+
+    function prepareTurn(turnIndex) {
+      const isA = turnIndex % 2 === 0;
+      const character = isA ? charA : charB;
+      const opponent = isA ? charB : charA;
+      const label = `Turn ${turnIndex + 1} (${isA ? "A" : "B"} · ${character.name})`;
+      const isClosing = Number.isFinite(endTurn) && turnIndex >= 2 && turnIndex >= endTurn - 2;
+      const { system, user, stop } = buildTurnPrompt({
+        character,
+        opponent,
+        topic: topicText,
+        transcript: history,
+        turnIndex,
+        isClosing,
+      });
+      const prep = tts.prepareTurn({ voice: isA ? voiceA : voiceB, label });
+      prefetchRef.current = prep;
+
+      // One generation attempt. The first ECHO_CHECK_CHARS characters are held
+      // back until we know the model isn't parroting the previous turn, so an
+      // echo is never spoken — it's discarded and regenerated instead.
+      async function attempt(userPrompt, temperature, t0) {
+        const filter = createSpeechFilter({ names: [character.name, opponent.name] });
+        const info = {};
+        let text = "";
+        let held = "";
+        let checked = false;
+        let echoed = false;
+        let first = true;
+        const release = (s) => {
+          if (checked) return prep.push(s);
+          held += s;
+          if (held.length < ECHO_CHECK_CHARS) return;
+          checked = true;
+          if (isEcho(held, history)) echoed = true;
+          else prep.push(held);
+        };
+        for await (const delta of streamTurn(engine, system, userPrompt, {
+          stop,
+          info,
+          temperature,
+          abortSignal: run.abortP,
+        })) {
+          if (run.aborted) break;
+          if (first) {
+            first = false;
+            log("LLM", `${label}: first token (${Math.round(performance.now() - t0)}ms)`);
+          }
+          const clean = filter.push(delta);
+          if (clean) {
+            text += clean;
+            release(clean);
+          }
+          if (echoed) break; // streamTurn's cleanup interrupts + drains the generation
+          if (filter.stopped) {
+            log("LLM", `${label}: model began scripting the next speaker — cut short`);
+            break;
+          }
+        }
+        if (run.aborted) throw new Aborted();
+        if (!echoed) {
+          const rest = filter.flush();
+          if (rest) {
+            text += rest;
+            release(rest);
+          }
+          if (!checked) {
+            checked = true;
+            if (isEcho(held, history)) echoed = true;
+            else if (held) prep.push(held);
+          }
+        }
+        return { text, info, echoed };
+      }
+
+      const generated = (async () => {
+        log("LLM", `${label}: generating…`);
+        const t0 = performance.now();
+        let { text, info, echoed } = await attempt(user, 0.8, t0);
+        if (echoed) {
+          log("WARN", `${label}: model repeated the previous turn — regenerating`);
+          ({ text, info, echoed } = await attempt(user + NO_ECHO_RETRY, 1.0, performance.now()));
+          if (echoed) {
+            log("WARN", `${label}: repeated again — skipping this turn`);
+            prep.finishInput();
+            return "";
+          }
+        }
+        const truncated = info.finishReason === "length";
+        prep.finishInput({ dropTail: truncated });
+        if (truncated) text = dropIncompleteTail(text);
+        text = text.replace(/\s+/g, " ").trim();
+        const words = text ? text.split(" ").length : 0;
+        log(
+          "LLM",
+          `${label}: finished — ${words} words in ${Math.round(performance.now() - t0)}ms` +
+            (truncated ? " (hit the length cap; unfinished sentence dropped)" : "")
+        );
+        if (text) {
+          history.push({ speakerName: character.name, text });
+          if (history.length > 6) history.splice(0, history.length - 6);
+        }
+        return text;
+      })();
+      // If generation fails, release whoever is waiting for this turn's audio so
+      // the error surfaces instead of hanging.
+      generated.catch(() => prep.finishInput());
+      return { speaker: isA ? "A" : "B", character, prep, generated };
+    }
+
+    let next = prepareTurn(startTurn);
+    for (let turn = startTurn; turn < endTurn; turn++) {
+      const cur = next;
+
+      // Wait until there's something to SAY — not for the whole turn. Only show
+      // "Preparing…" if that wait is noticeable, so there's no flicker when the
+      // prefetched turn is already ready (the common case).
+      const waitStart = performance.now();
+      const slow = setTimeout(() => {
+        if (runRef.current !== run || run.aborted) return;
+        setActiveSpeaker(null);
+        setStatus(turn === 0 ? "Preparing the opening…" : "Preparing next turn…");
+      }, 400);
+      try {
+        await until(run, cur.prep.firstReady);
+      } finally {
+        clearTimeout(slow);
+      }
+      const waitMs = Math.round(performance.now() - waitStart);
+      if (turn > startTurn && waitMs > 400) log("DEBATE", `waited ${waitMs}ms for Turn ${turn + 1} (pipeline behind)`);
+
+      setStatus("");
+      setActiveSpeaker(cur.speaker);
+      const entryId = appendEntry(cur.speaker, cur.character);
+      sessionRef.current = cur.prep;
+      // `heard` flips on the first revealed sentence. Continue resumes after the
+      // last turn the user actually heard — not one that was generated but cut
+      // off by Stop before a word of it played.
+      const record = { turn, speaker: cur.speaker, speakerName: cur.character.name, text: "", heard: false };
+      const playing = cur.prep.play((t) => {
+        record.heard = true;
+        updateEntry(entryId, t);
+      });
+
+      // The next turn rebuts this one, so it can only start generating once this
+      // turn's text is complete — while this turn is still being spoken.
+      const text = await until(run, cur.generated);
+      if (text) {
+        emptyStreak = 0;
+        record.text = text;
+        committedRef.current.push(record);
+        if (committedRef.current.length > 12) committedRef.current.splice(0, committedRef.current.length - 12);
+      } else {
+        setTranscript((t) => t.filter((e) => e.id !== entryId));
+        log("WARN", `Turn ${turn + 1}: the model produced no usable text — skipping`);
+        if (++emptyStreak >= 3) throw new Error("The model produced no usable text three times in a row. Try another model.");
+      }
+      nextTurnRef.current = turn + 1;
+      if (turn + 1 < endTurn) {
+        log("DEBATE", `prefetching Turn ${turn + 2} in the background`);
+        next = prepareTurn(turn + 1);
+      }
+
+      await until(run, playing);
+    }
+    return Number.isFinite(endTurn);
+  }
+
+  function stop() {
+    const run = runRef.current;
+    if (!run || run.finished || run.aborted) return;
+    log("DEBATE", "Stop requested — halting generation and audio");
+    run.abort();
+    haltAudio();
+    dropEmptyEntries();
+    setActiveSpeaker(null);
+    setStatus(
+      committedRef.current.some((r) => r.heard) ? "Stopped. Press Continue to pick up where it left off." : "Stopped."
+    );
+    setVoiceStatus("");
+    setPhase(PHASES.DONE);
+    releaseWakeLock();
+  }
+
+  function clearDebate() {
+    setTranscript([]);
+    committedRef.current = [];
+    nextTurnRef.current = 0;
+    setStatus("");
+    setError("");
+    setPhase(PHASES.SETUP);
   }
 
   const busy = phase === PHASES.LOADING || phase === PHASES.DEBATING;
+  const canResume = !busy && transcript.length > 0;
+  const ready = gpu.checked && !!model;
+  const liteMode = gpu.checked && !gpu.webgpu;
+  const speakerName = activeSpeaker === "A" ? charA.name : activeSpeaker === "B" ? charB.name : null;
+  const dockText =
+    phase === PHASES.LOADING
+      ? `${status || "Loading…"}`
+      : speakerName
+      ? `${speakerName} is speaking`
+      : status || "Thinking…";
 
   return (
-    <div className="app">
+    <div className={`app${busy ? " busy" : ""}`}>
       <header className="hero">
         <div className="hero-row">
-          <h1>
-            🗣️ Dialectica
-          </h1>
+          <h1>🗣️ Dialectica</h1>
           <button
             className="info-btn"
             onClick={() => setShowInfo(true)}
@@ -320,14 +597,15 @@ export default function App() {
         <p className="tagline">Two AI minds debate any topic — with streaming voices, entirely in your browser.</p>
       </header>
 
-      {!webgpu && (
+      {liteMode && (
         <div className="banner warn">
-          ⚠️ WebGPU not detected. The on-device LLM needs it — try the latest Chrome or Edge.
+          ⚡ WebGPU isn't available in this browser, so Dialectica runs in <strong>Lite CPU mode</strong> — a
+          smaller, slower model. For the full experience use a recent Chrome, Edge or Safari.
         </div>
       )}
       {error && <div className="banner error">{error}</div>}
 
-      <div className="stage">
+      <div className={`stage${busy ? " compact" : ""}`}>
         <DebaterCard
           side="A"
           label="For the topic"
@@ -339,6 +617,7 @@ export default function App() {
           webVoices={webSpeechVoiceOptions}
           active={activeSpeaker === "A"}
           disabled={busy}
+          compact={busy}
         />
 
         <div className="vs">VS</div>
@@ -354,103 +633,108 @@ export default function App() {
           webVoices={webSpeechVoiceOptions}
           active={activeSpeaker === "B"}
           disabled={busy}
+          compact={busy}
         />
       </div>
 
       <div className="controls">
-        <label className="field topic">
-          <span>Debate topic</span>
-          <div className="topic-row">
-            <input
-              type="text"
-              value={topic}
-              disabled={busy}
-              onChange={(e) => setTopic(e.target.value)}
-              placeholder="Type a topic, or pick one →"
-            />
-            <button className="ghost" disabled={busy} onClick={() => setTopic(randomTopic())} title="Random topic">
-              🎲
-            </button>
+        {busy ? (
+          <div className="topic-now">
+            <span>Topic</span>
+            <p>{topic}</p>
           </div>
-          <select
-            disabled={busy}
-            value=""
-            onChange={(e) => e.target.value && setTopic(e.target.value)}
-          >
-            <option value="">Prepared topics…</option>
-            {PRESET_TOPICS.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <div className="settings">
-          <label className="field">
-            <span>Model (WebGPU)</span>
-            <select value={model} disabled={busy} onChange={(e) => setModel(e.target.value)}>
-              {MODELS.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="field">
-            <span>Voice engine</span>
-            <select value={ttsEngine} disabled={busy} onChange={(e) => setTtsEngine(e.target.value)}>
-              {TTS_ENGINES.map((e) => (
-                <option key={e.id} value={e.id}>
-                  {e.label}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <label className="field">
-            <span>Length: {infinite ? "∞ until you stop" : `${turns} turns`}</span>
-            <input
-              type="range"
-              min="2"
-              max="12"
-              step="2"
-              value={turns}
-              disabled={busy || infinite}
-              onChange={(e) => setTurns(Number(e.target.value))}
-            />
-            <label className="checkline">
-              <input
-                type="checkbox"
-                checked={infinite}
-                disabled={busy}
-                onChange={(e) => setInfinite(e.target.checked)}
-              />
-              <span>Debate indefinitely (until you press Stop)</span>
+        ) : (
+          <>
+            <label className="field topic">
+              <span>Debate topic</span>
+              <div className="topic-row">
+                <input
+                  type="text"
+                  value={topic}
+                  onChange={(e) => setTopic(e.target.value)}
+                  placeholder="Type a topic, or pick one →"
+                  enterKeyHint="go"
+                />
+                <button className="ghost" onClick={() => setTopic(randomTopic())} title="Random topic" aria-label="Random topic">
+                  🎲
+                </button>
+              </div>
+              <select value="" onChange={(e) => e.target.value && setTopic(e.target.value)}>
+                <option value="">Prepared topics…</option>
+                {PRESET_TOPICS.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
             </label>
-          </label>
-        </div>
 
-        <div className="actions">
-          {phase === PHASES.SETUP || phase === PHASES.DONE ? (
-            <button className="primary" onClick={start} disabled={!webgpu}>
-              ▶ Start debate
-            </button>
-          ) : (
-            <button className="danger" onClick={stop}>
-              ■ Stop
-            </button>
-          )}
-          {transcript.length > 0 && !busy && (
-            <button className="ghost" onClick={reset}>
-              ↺ Reset
-            </button>
-          )}
-        </div>
+            <div className="settings">
+              <label className="field">
+                <span>Model</span>
+                <select value={model || ""} disabled={!gpu.checked} onChange={(e) => setModel(e.target.value)}>
+                  {!gpu.checked && <option value="">Checking your device…</option>}
+                  {MODELS.map((m) => (
+                    <option key={m.id} value={m.id} disabled={gpu.checked && !gpu.webgpu && m.id !== CPU_MODEL_ID}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                <span>Voice engine</span>
+                <select value={ttsEngine} onChange={(e) => setTtsEngine(e.target.value)}>
+                  {TTS_ENGINES.map((e) => (
+                    <option key={e.id} value={e.id}>
+                      {e.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="field">
+                <span>Length: {infinite ? "∞ until you stop" : `${turns} turns`}</span>
+                <input
+                  type="range"
+                  min="2"
+                  max="12"
+                  step="2"
+                  value={turns}
+                  disabled={infinite}
+                  onChange={(e) => setTurns(Number(e.target.value))}
+                />
+                <label className="checkline">
+                  <input type="checkbox" checked={infinite} onChange={(e) => setInfinite(e.target.checked)} />
+                  <span>Debate indefinitely (until you press Stop)</span>
+                </label>
+              </label>
+            </div>
+
+            <div className="actions">
+              {canResume ? (
+                <>
+                  <button className="primary" onClick={() => start(true)} disabled={!ready}>
+                    ▶ Continue debate
+                  </button>
+                  <button className="ghost" onClick={() => start(false)} disabled={!ready}>
+                    ↻ New debate
+                  </button>
+                  <button className="ghost" onClick={clearDebate} title="Clear the transcript">
+                    Clear
+                  </button>
+                </>
+              ) : (
+                <button className="primary" onClick={() => start(false)} disabled={!ready}>
+                  {gpu.checked ? "▶ Start debate" : "Checking your device…"}
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
 
-      {(busy || status) && (
+      {(phase === PHASES.LOADING || (!busy && status)) && (
         <div className="status">
           {phase === PHASES.LOADING && (
             <div className="progressbar">
@@ -458,10 +742,11 @@ export default function App() {
             </div>
           )}
           <span>{status}</span>
+          {voiceStatus && <span className="voice-status">{voiceStatus}</span>}
         </div>
       )}
 
-      <Transcript entries={transcript} activeSpeaker={activeSpeaker} />
+      <Transcript entries={transcript} />
 
       <footer className="foot">
         Runs 100% in your browser · No backend · No API keys · Models cached after first load
@@ -471,6 +756,16 @@ export default function App() {
           Zaher Alkaei
         </a>
       </footer>
+
+      {busy && (
+        <div className="dock" role="region" aria-label="Debate controls">
+          <span className={`dock-dot${speakerName ? " live" : ""}`} aria-hidden />
+          <span className="dock-text">{dockText}</span>
+          <button className="danger" onClick={stop}>
+            ■ Stop
+          </button>
+        </div>
+      )}
 
       {showInfo && (
         <div className="modal-overlay" onClick={() => setShowInfo(false)}>
@@ -486,21 +781,22 @@ export default function App() {
             </p>
             <ul>
               <li>
-                <strong>LLM:</strong> A small instruction-tuned language model (default Llama 3.2 3B)
-                runs on-device via <em>WebGPU</em> using WebLLM. One engine serves both debaters; the
-                system prompt is swapped each turn to switch personas. The model is downloaded once
-                and cached in your browser (IndexedDB) for instant subsequent loads.
+                <strong>LLM:</strong> A small instruction-tuned language model runs on-device via{" "}
+                <em>WebGPU</em> using WebLLM (Llama 3.2 3B by default, 1B on phones). One engine serves
+                both debaters; the system prompt is swapped each turn. Without WebGPU, a{" "}
+                <em>Lite CPU</em> model runs instead, so it works in any modern browser. Models are
+                downloaded once and cached.
               </li>
               <li>
-                <strong>Voice:</strong> Streaming text-to-speech turns each debater's text into speech
-                as it's generated. The default <em>Web Speech</em> engine uses your browser's built-in
-                voices — zero download, instant. An optional <em>Piper</em> neural engine (~40 MB per
-                voice) gives higher-quality speech and runs on the CPU so the GPU stays with the LLM.
+                <strong>Voice:</strong> Each sentence is spoken as soon as it's written. The default{" "}
+                <em>Web Speech</em> engine uses your browser's built-in voices — zero download, instant.
+                The optional <em>Piper</em> neural engine (~40 MB per voice) sounds more natural and runs on
+                the CPU so the GPU stays with the LLM.
               </li>
               <li>
-                <strong>Pipeline:</strong> While one debater is speaking, the next debater's turn is
-                already being generated and synthesized in the background, keeping the back-and-forth
-                snappy with minimal gaps.
+                <strong>Pipeline:</strong> While one debater speaks, the next one is already writing,
+                keeping the back-and-forth snappy. Memory is limited to the last two turns, so a debate can
+                run indefinitely without slowing down. Stop halts everything instantly; Continue resumes.
               </li>
             </ul>
             <h3>Disclaimer</h3>

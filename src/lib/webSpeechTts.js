@@ -1,247 +1,311 @@
-// Web Speech API TTS — the lightest possible engine: zero download, zero
-// dependencies, instant. Uses the browser's built-in speechSynthesis, which
-// runs natively on the main thread (no worker, no WASM, no model files).
+// Web Speech API TTS — the lightest engine: zero download, zero dependencies,
+// instant. Uses the browser's built-in speechSynthesis (OS voices).
 //
-// Same prepareTurn interface as the Piper backend (tts.js), so the debate
-// pipeline doesn't need to know which engine is active:
+// Same turn interface as the Piper backend (see tts.js). Sentences are spoken
+// as soon as the LLM finishes each one, so a turn starts talking long before
+// it's fully generated.
 //
-//   const prep = backend.prepareTurn({ voice });
-//   prep.push(deltaText);        // feed streaming LLM tokens (splits into sentences)
-//   prep.finishInput();          // no more text coming
-//   await prep.play(onReveal);   // speak sentence-by-sentence, reveal text in sync
-//   prep.cancel();
-//
-// Unlike Piper, Web Speech can't pre-synthesize audio during LLM generation —
-// but it doesn't need to: there's no model load or inference, so speaking
-// starts instantly when play() is called. The sentence chunking still applies
-// so the transcript reveals in sync with the voice.
+// speechSynthesis is notoriously flaky across browsers, and every quirk below
+// used to be able to hang the debate forever:
+//   • Chrome drops `onend` for utterances that get garbage-collected → we keep
+//     references until the turn ends.
+//   • Some engines go silent without firing end/error → a watchdog notices the
+//     synth is idle with sentences outstanding and moves on.
+//   • A machine with no installed voices never speaks at all → text-only mode,
+//     paced at reading speed.
+//   • iOS/Android only allow speech after it was first used inside a tap →
+//     unlockSpeech() is called from the Start click.
 
 import { log } from "./logger.js";
 
 const SENTENCE_RE = /[^.!?…\n]+[.!?…]+["'”’)]*|\n+/g;
+const WORDS_PER_SEC = 2.6; // speaking-rate estimate for pacing and watchdogs
 
-// speechSynthesis.getVoices() returns [] until the browser loads system voices
-// (async on Chrome). Wait for the voiceschanged event, with a timeout fallback.
-function waitForVoices(timeoutMs = 2000) {
+const synthOrNull = () => (typeof window !== "undefined" && "speechSynthesis" in window ? window.speechSynthesis : null);
+
+// getVoices() returns [] until the browser has loaded them (async in Chrome).
+function waitForVoices(timeoutMs = 2500) {
   return new Promise((resolve) => {
-    if (!("speechSynthesis" in window)) return resolve([]);
-    const existing = window.speechSynthesis.getVoices();
+    const synth = synthOrNull();
+    if (!synth) return resolve([]);
+    const existing = synth.getVoices();
     if (existing.length > 0) return resolve(existing);
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
-      window.speechSynthesis.removeEventListener("voiceschanged", finish);
-      resolve(window.speechSynthesis.getVoices());
+      synth.removeEventListener?.("voiceschanged", finish);
+      resolve(synth.getVoices());
     };
-    window.speechSynthesis.addEventListener("voiceschanged", finish);
+    synth.addEventListener?.("voiceschanged", finish);
     setTimeout(finish, timeoutMs);
   });
 }
 
+// Must be called synchronously inside a user gesture (the Start click). Mobile
+// browsers refuse to speak until speechSynthesis was used from a tap, and our
+// first real sentence arrives many seconds later.
+export function unlockSpeech() {
+  const synth = synthOrNull();
+  if (!synth) return;
+  try {
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0;
+    synth.speak(u);
+  } catch {}
+}
+
+const FEMALE_RE =
+  /female|woman|samantha|victoria|karen|moira|tessa|fiona|serena|kate|zira|aria|jenny|libby|sonia|hazel|susan|heather|amy|emma|ava|allison|natasha|catherine/i;
+const MALE_RE =
+  /\bmale\b|\bman\b|daniel|david|alex|fred|oliver|arthur|rishi|george|guy|ryan|thomas|james|mark|aaron|gordon|christopher|eric|liam|william/i;
+
+// Resolve a preference — { uri, hint: { lang, gender } } — to a system voice,
+// avoiding `avoid` (the other debater's voice) unless the user explicitly chose
+// the same one.
+function pickVoice(voices, pref, avoid) {
+  if (!voices.length) return null;
+  const uri = typeof pref === "string" ? pref : pref?.uri;
+  if (uri) {
+    const exact = voices.find((v) => v.voiceURI === uri || v.name === uri);
+    if (exact) return exact;
+  }
+  const hint = (typeof pref === "object" && pref?.hint) || {};
+  const lang = (hint.lang || "en").toLowerCase();
+  const norm = (v) => v.lang.toLowerCase().replace("_", "-");
+  let pool = voices.filter((v) => norm(v).startsWith(lang));
+  if (!pool.length) pool = voices.filter((v) => norm(v).startsWith("en"));
+  if (!pool.length) pool = voices;
+  const others = pool.filter((v) => v !== avoid);
+  const candidates = others.length ? others : pool;
+  if (hint.gender === "female") {
+    const v = candidates.find((x) => FEMALE_RE.test(x.name));
+    if (v) return v;
+  } else if (hint.gender === "male") {
+    const v = candidates.find((x) => MALE_RE.test(x.name) && !FEMALE_RE.test(x.name));
+    if (v) return v;
+  }
+  return candidates[0];
+}
+
 export class WebSpeechTTS {
-  constructor(audioCtx = null) {
-    // AudioContext is unused — Web Speech goes through the OS audio path, not
-    // Web Audio. Kept for interface compatibility with TTSBackend.
-    this.ctx = audioCtx;
+  constructor(voiceCount) {
+    this.voiceCount = voiceCount;
   }
 
-  static async load({ voices = [], onProgress, audioCtx = null } = {}) {
-    if (!("speechSynthesis" in window)) {
-      throw new Error("Web Speech API not available in this browser");
-    }
-    const available = await waitForVoices();
-    log("TTS", `Web Speech ready — ${available.length} system voice(s) available`);
-    return new WebSpeechTTS(audioCtx);
+  static async load() {
+    const synth = synthOrNull();
+    const voices = synth ? await waitForVoices() : [];
+    if (!synth) log("WARN", "Web Speech isn't available in this browser — the debate will be shown as text only");
+    else if (!voices.length) log("WARN", "No system voices installed — the debate will be shown as text, paced at reading speed");
+    else log("TTS", `Web Speech ready — ${voices.length} system voice(s)`);
+    return new WebSpeechTTS(voices.length);
+  }
+
+  // Pick one voice per debater, making them different whenever possible (two
+  // "auto" debaters used to end up with the same first English voice).
+  cast(prefs) {
+    const voices = synthOrNull()?.getVoices() || [];
+    const a = pickVoice(voices, prefs[0], null);
+    const b = pickVoice(voices, prefs[1], a);
+    log("TTS", `Voices: A → ${a?.name ?? "text only"}, B → ${b?.name ?? "text only"}`);
+    return [a, b];
   }
 
   prepareTurn({ voice, label = "turn" }) {
-    return new WebSpeechPreparedTurn(this, voice, label);
+    return new WebSpeechPreparedTurn(voice, label);
   }
 
-  cancel() {
+  cancelAll() {
     try {
-      window.speechSynthesis?.cancel();
+      synthOrNull()?.cancel();
     } catch {}
   }
 
   dispose() {
-    this.cancel();
+    this.cancelAll();
   }
 }
 
-// One debater's turn. Streaming LLM tokens are split into sentences (same regex
-// as the Piper backend) and queued as separate SpeechSynthesisUtterance objects
-// so text reveals in sync with each sentence starting to speak.
 class WebSpeechPreparedTurn {
-  constructor(backend, voicePref, label = "turn") {
-    this.backend = backend;
-    // voicePref can be:
-    //   - a voiceURI string (user picked a specific voice from the dropdown)
-    //   - { lang, gender } hint from the preset character
-    //   - null/undefined (auto-select)
-    this.voicePref = voicePref;
+  constructor(voice, label) {
+    this.voice = voice;
     this.label = label;
-    this.buffer = ""; // raw incoming text not yet split into sentences
-    this.sentences = []; // completed sentences to speak
+    this.buffer = "";
+    this.sentences = [];
+    this.inputDone = false;
     this.canceled = false;
-    this._doneResolve = null;
+    this.firstReady = new Promise((r) => (this._firstReadyResolve = r));
+    this._onNew = null; // set by play(): called whenever a sentence is added / input ends
+    this._finish = null;
+    this._timer = null;
+    this._utterances = []; // strong refs — see the GC note at the top
   }
 
-  _addSentence(sentence) {
+  _add(sentence) {
     const clean = sentence.trim();
     if (!clean || this.canceled) return;
     this.sentences.push(clean);
+    this._firstReadyResolve();
+    this._onNew?.();
   }
 
-  // Feed streaming LLM tokens; complete sentences are extracted immediately.
   push(delta) {
-    if (this.canceled) return;
+    if (this.canceled || this.inputDone) return;
     this.buffer += delta;
     let match;
     let lastIndex = 0;
     SENTENCE_RE.lastIndex = 0;
     while ((match = SENTENCE_RE.exec(this.buffer)) !== null) {
-      this._addSentence(match[0]);
+      this._add(match[0]);
       lastIndex = SENTENCE_RE.lastIndex;
     }
     if (lastIndex > 0) this.buffer = this.buffer.slice(lastIndex);
   }
 
-  // No more text — fold any trailing partial sentence in.
-  finishInput() {
-    if (this.canceled) return;
+  // No more text. `dropTail` (the turn hit the token cap) discards an
+  // unfinished trailing sentence instead of speaking a cut-off fragment.
+  finishInput({ dropTail = false } = {}) {
+    if (this.inputDone) return;
     const tail = this.buffer.trim();
-    if (tail) this.sentences.push(tail);
     this.buffer = "";
-    log("TTS", `${this.label}: ${this.sentences.length} sentence(s) ready for Web Speech`);
+    if (tail && !(dropTail && this.sentences.length)) this._add(tail);
+    this.inputDone = true;
+    if (!this.canceled) log("TTS", `${this.label}: ${this.sentences.length} sentence(s) for Web Speech`);
+    this._firstReadyResolve();
+    this._onNew?.();
   }
 
-  // Web Speech doesn't pre-synthesize — nothing to wait for.
-  async ready() {}
+  // Speak sentences as they arrive; resolve once input is done and every
+  // sentence has been spoken (or skipped by the watchdog). onReveal fires as
+  // each sentence starts, keeping the transcript in sync with the voice.
+  play(onReveal) {
+    if (this.canceled) return Promise.resolve();
+    const synth = synthOrNull();
+    const speakable = !!synth && synth.getVoices().length > 0;
+    log("PLAY", `${this.label}: now speaking${speakable ? "" : " (text only)"}`);
 
-  // Resolve the voice preference to a SpeechSynthesisVoice object.
-  _resolveVoice() {
-    if (!("speechSynthesis" in window)) return null;
-    const voices = window.speechSynthesis.getVoices();
-    if (!voices.length) return null;
+    return new Promise((resolve) => {
+      let queued = 0; // sentences handed to the synth (or the pacer)
+      let ended = 0; // sentences finished
+      let revealedTo = -1;
+      let lastProgress = performance.now();
+      let finished = false;
 
-    const pref = this.voicePref;
-
-    // User-selected specific voice by URI or name.
-    if (typeof pref === "string" && pref) {
-      const match = voices.find((v) => v.voiceURI === pref || v.name === pref);
-      if (match) return match;
-    }
-
-    // Preset hint: { lang, gender }.
-    if (pref && typeof pref === "object") {
-      const lang = pref.lang?.toLowerCase() || "en";
-      const langMatches = voices.filter((v) => v.lang.toLowerCase().startsWith(lang));
-      if (langMatches.length === 0) {
-        const en = voices.find((v) => v.lang.toLowerCase().startsWith("en"));
-        return en || voices[0];
-      }
-      if (pref.gender === "female") {
-        const female = langMatches.find((v) =>
-          /female|woman|girl|samantha|victoria|amy|kate|zira|heather|serena|fiona|google uk english female/i.test(
-            v.name
-          )
-        );
-        if (female) return female;
-      } else if (pref.gender === "male") {
-        const male = langMatches.find((v) =>
-          /male|man|boy|david|daniel|alex|fred|rishi|arthur|oliver|google uk english male/i.test(
-            v.name
-          )
-        );
-        if (male) return male;
-      }
-      return langMatches[0];
-    }
-
-    // Default: first English voice, or first available.
-    const en = voices.find((v) => v.lang.toLowerCase().startsWith("en"));
-    return en || voices[0];
-  }
-
-  // Queue all sentences as utterances (gapless) and resolve when the last one
-  // ends. onReveal fires as each sentence starts speaking.
-  async play(onReveal) {
-    if (this.canceled || this.sentences.length === 0) return;
-    if (!("speechSynthesis" in window)) {
-      onReveal?.(this.sentences.join(" "));
-      log("WARN", `${this.label}: Web Speech not available — text shown without audio`);
-      return;
-    }
-
-    const synth = window.speechSynthesis;
-    const voice = this._resolveVoice();
-
-    // Stop anything currently speaking (e.g. a previous canceled turn).
-    synth.cancel();
-
-    let shown = "";
-    const n = this.sentences.length;
-    log("PLAY", `${this.label}: now speaking (${n} sentence(s), Web Speech)`);
-
-    const done = new Promise((resolve) => {
-      this._doneResolve = resolve;
-    });
-
-    // Chrome's speechSynthesis has a long-standing bug where it pauses after
-    // ~15 seconds of continuous speaking without ever resuming. Polling
-    // resume() keeps long turns (a minute+) audible. The poll stops on done.
-    this._keepAlive = setInterval(() => {
-      if (this.canceled) return;
-      if (window.speechSynthesis.paused) window.speechSynthesis.resume();
-    }, 5000);
-
-    for (let i = 0; i < this.sentences.length; i++) {
-      const text = this.sentences[i];
-      shown = shown ? `${shown} ${text}` : text;
-
-      const utterance = new SpeechSynthesisUtterance(text);
-      if (voice) {
-        utterance.voice = voice;
-        utterance.lang = voice.lang;
-      }
-      utterance.rate = 1.0;
-
-      const reveal = shown;
-      const segNo = i + 1;
-      const isLast = i === n - 1;
-
-      utterance.onstart = () => {
-        if (this.canceled) return;
-        log("PLAY", `${this.label}: seg ${segNo}/${n} audible`);
-        onReveal?.(reveal);
+      const reveal = (i) => {
+        if (i <= revealedTo || this.canceled) return;
+        revealedTo = i;
+        log("PLAY", `${this.label}: sentence ${i + 1} audible`);
+        onReveal?.(this.sentences.slice(0, i + 1).join(" "));
       };
 
-      if (isLast) {
-        utterance.onend = () => {
-          if (!this.canceled) log("PLAY", `${this.label}: finished speaking`);
-          clearInterval(this._keepAlive);
-          this._doneResolve?.();
-        };
-        utterance.onerror = () => {
-          clearInterval(this._keepAlive);
-          this._doneResolve?.();
-        };
-      }
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearInterval(watchdog);
+        clearTimeout(this._timer);
+        this._onNew = null;
+        this._finish = null;
+        this._utterances = [];
+        if (!this.canceled) {
+          reveal(this.sentences.length - 1);
+          log("PLAY", `${this.label}: finished speaking`);
+        }
+        resolve();
+      };
+      this._finish = finish;
 
-      synth.speak(utterance);
-    }
+      const maybeDone = () => {
+        if (this.canceled || (this.inputDone && ended >= this.sentences.length)) finish();
+      };
 
-    await done;
+      // Real speech: queue every available sentence. speak() appends to the
+      // engine's queue, so consecutive sentences play back-to-back.
+      const speakAvailable = () => {
+        while (queued < this.sentences.length && !this.canceled) {
+          const i = queued++;
+          const u = new SpeechSynthesisUtterance(this.sentences[i]);
+          const live = this.voice && synth.getVoices().find((v) => v.voiceURI === this.voice.voiceURI);
+          const voice = live || this.voice;
+          if (voice) {
+            u.voice = voice;
+            u.lang = voice.lang;
+          }
+          u.onstart = () => {
+            lastProgress = performance.now();
+            reveal(i);
+          };
+          u.onend = u.onerror = () => {
+            lastProgress = performance.now();
+            reveal(i);
+            ended = Math.max(ended, i + 1);
+            maybeDone();
+          };
+          this._utterances.push(u);
+          lastProgress = performance.now();
+          synth.speak(u);
+        }
+        maybeDone();
+      };
+
+      // No voices: reveal one sentence at a time at a natural reading pace.
+      const paceNext = () => {
+        this._timer = null;
+        if (this.canceled) return finish();
+        if (queued < this.sentences.length) {
+          const i = queued++;
+          reveal(i);
+          const words = this.sentences[i].split(/\s+/).length;
+          this._timer = setTimeout(() => {
+            ended = i + 1;
+            paceNext();
+          }, Math.max(1200, (words / WORDS_PER_SEC) * 1000));
+        } else maybeDone();
+      };
+
+      this._onNew = speakable ? speakAvailable : () => !this._timer && paceNext();
+
+      const watchdog = setInterval(() => {
+        if (this.canceled) return finish();
+        if (!speakable) return;
+        if (synth.paused) synth.resume(); // Chrome occasionally pauses its queue
+        const outstanding = queued - ended;
+        if (outstanding <= 0) return;
+        const idle = !synth.speaking && !synth.pending;
+        const words = (this.sentences[ended] || "").split(/\s+/).length;
+        const budget = Math.max(8000, (words / WORDS_PER_SEC) * 1000 * 2.5);
+        const quietFor = performance.now() - lastProgress;
+        if ((idle && quietFor > 1500) || quietFor > budget) {
+          // The engine stopped reporting progress — events were lost or speech
+          // got stuck. Skip ahead instead of hanging the debate.
+          log("WARN", `${this.label}: speech engine went quiet — moving on`);
+          if (!idle) {
+            try {
+              synth.cancel();
+            } catch {}
+          }
+          reveal(queued - 1);
+          ended = queued;
+          maybeDone();
+        }
+      }, 500);
+
+      this._onNew();
+    });
   }
 
   cancel() {
+    if (this.canceled) return;
     this.canceled = true;
-    clearInterval(this._keepAlive);
-    try {
-      window.speechSynthesis?.cancel();
-    } catch {}
-    this._doneResolve?.();
+    clearTimeout(this._timer);
+    // Only silence the engine if THIS turn is the one speaking — canceling the
+    // prefetched next turn must not cut off the current speaker.
+    if (this._finish) {
+      try {
+        synthOrNull()?.cancel();
+      } catch {}
+    }
+    this._firstReadyResolve();
+    this._finish?.();
   }
 }

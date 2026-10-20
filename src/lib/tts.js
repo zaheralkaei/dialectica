@@ -1,89 +1,96 @@
-// Streaming TTS, run in a Web Worker.
+// Piper TTS backend (neural voices, synthesized in a Web Worker).
 //
-// Two-phase design. It lets us PREPARE a debater's turn — run the LLM and
-// synthesize the audio — while the *previous* debater is still speaking, then
-// PLAY it on cue with the text revealed in sync:
+// Shared turn interface — implemented here and by webSpeechTts.js, so the debate
+// loop doesn't care which engine is active:
 //
-//   const prep = backend.prepareTurn({ voice });
-//   prep.push(deltaText);        // feed streaming LLM tokens; synthesis starts NOW
-//   prep.finishInput();          // no more text coming
-//   await prep.play(onReveal);   // play buffered audio; reveal text sentence-by-sentence
-//   prep.cancel();
+//   const prep = backend.prepareTurn({ voice, label });
+//   prep.push(deltaText);              // feed streaming LLM text; synthesis starts NOW
+//   await prep.firstReady;             // something is ready to be heard
+//   const done = prep.play(onReveal);  // starts playing; keeps going as segments arrive
+//   prep.finishInput({ dropTail });    // no more text coming
+//   await done;   prep.cancel();
 //
-// Synthesis runs off the main thread in piperWorker.js — onnxruntime WASM would
-// freeze the UI (and stall the LLM token stream) if run on the main thread. The
-// main thread only schedules the returned PCM. The engine (Piper) is behind the
-// worker's simple {load,gen}->{ready,audio} protocol, so nothing here is
-// engine-specific and it can be swapped without touching this file.
+// Playback streams: it starts with the first synthesized segment and picks up
+// later ones as they finish, so a slow turn no longer makes the listener wait
+// for the whole thing. Synthesis runs in piperWorker.js — onnxruntime WASM on
+// the main thread would freeze the UI and stall the LLM token stream.
 
 import { log } from "./logger.js";
 
 const SENTENCE_RE = /[^.!?…\n]+[.!?…]+["'”’)]*|\n+/g;
 
-// We don't synthesize one sentence at a time — we group whole sentences into a
-// segment until it reaches this many characters, then send the segment to the
-// worker as a single generate() call. Longer segments give the model more
-// context for natural prosody; the first one costs a bit more latency, but while
-// it plays the next segments finish generating, so the pipeline hides that cost.
-// Tune this to trade first-audio latency (lower) vs. prosody/fewer seams (higher).
+// Sentences are grouped into segments before synthesis: longer segments give
+// better prosody and fewer seams. The FIRST segment is kept short so the first
+// audio of a turn arrives quickly; later ones synthesize while it plays.
+const FIRST_SEGMENT_CHARS = 90;
 const MIN_SEGMENT_CHARS = 240;
 
-// Safety net: if the worker never returns a segment (crash, unexpected state),
-// give up on it after this long so a single segment can't stall the debate. A
-// timed-out segment resolves null and is simply skipped in playback.
-const SYNTH_TIMEOUT_MS = 90000;
+// Synth watchdogs. The budget only starts when the worker actually STARTS a job
+// (it acks with 'start'), so time spent queued behind other segments no longer
+// counts against it — that used to time segments out on slower machines.
+const synthBudgetMs = (chars) => Math.min(90000, 20000 + chars * 120);
+const QUEUE_TIMEOUT_MS = 180000; // a job that never starts at all (dead worker)
 
 export class TTSBackend {
   constructor(worker, ctx = null) {
     this.worker = worker;
-    // The AudioContext may be created (and resumed) by the caller inside the
-    // user-gesture handler and passed in — browsers only let audio start after
-    // a user activation, and by the time the first turn is synthesized we're
-    // long past the click. If none is provided we lazily create our own.
+    // The AudioContext is created and resumed by the caller inside the click
+    // handler — browsers only allow audio after a user gesture.
     this.ctx = ctx;
     this.ownsCtx = !ctx;
     this.reqId = 0;
-    this.pending = new Map(); // request id -> { resolve }
+    this.pending = new Map(); // request id -> { resolve, chars, timer }
     this.worker.addEventListener("message", (e) => {
       const m = e.data;
-      if (m.type !== "audio") return;
       const p = this.pending.get(m.id);
       if (!p) return;
-      this.pending.delete(m.id);
-      // A failed segment resolves null (skipped in playback) rather than
-      // rejecting, so one bad segment can't abort the turn.
-      if (m.error) {
-        log("WARN", `synth error for request ${m.id}: ${m.error}`);
-        p.resolve(m); // carries { error } — the prepared turn logs it with context
-      } else {
-        p.resolve(m); // { audio, sampling_rate, ms }
+      if (m.type === "start") {
+        clearTimeout(p.timer);
+        p.timer = setTimeout(() => this._timeout(m.id, "synthesis"), synthBudgetMs(p.chars));
+      } else if (m.type === "audio") {
+        if (m.error) log("WARN", `synth error for request ${m.id}: ${m.error}`);
+        p.resolve(m.error ? null : m); // null = skipped in playback
       }
     });
   }
 
-  // `voices` are pre-downloaded and the pipeline warmed up during load so the
-  // debate's first segment isn't cold.
+  // Create the worker and pre-download + warm up the given voices.
   static async load({ voices = [], onProgress, audioCtx = null } = {}) {
-    const worker = new Worker(new URL("./piperWorker.js", import.meta.url), {
-      type: "module",
-    });
-    await new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./piperWorker.js", import.meta.url), { type: "module" });
+    const backend = new TTSBackend(worker, audioCtx);
+    try {
+      await backend.prepareVoices(voices, onProgress);
+    } catch (e) {
+      worker.terminate();
+      throw e;
+    }
+    return backend;
+  }
+
+  // Make sure these voices are cached and the engine is warm. Cheap when they
+  // already are, so the backend is reused across debates instead of spawning a
+  // new worker (and re-downloading every voice) on each Start.
+  prepareVoices(voices, onProgress) {
+    return new Promise((resolve, reject) => {
       const onMsg = (e) => {
         const m = e.data;
         if (m.type === "progress") onProgress?.(m.p);
-        else if (m.type === "ready") {
-          worker.removeEventListener("message", onMsg);
-          log("TTS", "Piper voices ready");
-          resolve();
-        } else if (m.type === "error") {
-          worker.removeEventListener("message", onMsg);
-          reject(new Error(m.error));
+        else if (m.type === "ready" || m.type === "error") {
+          this.worker.removeEventListener("message", onMsg);
+          if (m.type === "ready") {
+            log("TTS", "Piper voices ready");
+            resolve();
+          } else reject(new Error(m.error));
         }
       };
-      worker.addEventListener("message", onMsg);
-      worker.postMessage({ type: "load", voices });
+      this.worker.addEventListener("message", onMsg);
+      this.worker.postMessage({ type: "load", voices });
     });
-    return new TTSBackend(worker, audioCtx);
+  }
+
+  // Map each debater's voice preference to what prepareTurn() needs.
+  cast(prefs) {
+    return prefs;
   }
 
   _audioCtx() {
@@ -95,25 +102,28 @@ export class TTSBackend {
     return this.ctx;
   }
 
-  // Fire off synthesis of one segment in the worker. Returns a promise for its
-  // PCM. Calls pipeline in the worker and are processed in order. A generous
-  // timeout guarantees a stuck/crashed worker can never hang the whole debate —
-  // a timed-out segment resolves as null and is simply skipped in playback.
+  _timeout(id, phase) {
+    const p = this.pending.get(id);
+    if (!p) return;
+    log("WARN", `synth request ${id} timed out (${phase}) — skipping that segment`);
+    p.resolve(null);
+  }
+
+  // Synthesize one segment in the worker. Always resolves: PCM on success, null
+  // on error / timeout / cancel (the segment is then skipped).
   synth(text, voice) {
     const id = ++this.reqId;
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          log("WARN", `synth request ${id} timed out after ${SYNTH_TIMEOUT_MS / 1000}s`);
-          resolve(null);
-        }
-      }, SYNTH_TIMEOUT_MS);
-      this.pending.set(id, {
+      const entry = {
+        chars: text.length,
+        timer: setTimeout(() => this._timeout(id, "never started"), QUEUE_TIMEOUT_MS),
         resolve: (v) => {
-          clearTimeout(timer);
+          clearTimeout(entry.timer);
+          this.pending.delete(id);
           resolve(v);
         },
-      });
+      };
+      this.pending.set(id, entry);
       this.worker.postMessage({ type: "gen", id, text, voice });
     });
   }
@@ -122,77 +132,85 @@ export class TTSBackend {
     return new PreparedTurn(this, voice, label);
   }
 
-  cancel() {
-    // Only tear down a context we created ourselves. A caller-provided context
-    // is reused across debates, so closing it here would silence every run
-    // after the first — in-flight audio is already stopped via each prepared
-    // turn's own cancel().
+  // Stop: drop every queued synthesis job so the next debate doesn't wait behind
+  // a stopped one, and release whoever is waiting on them.
+  cancelAll() {
+    this.worker.postMessage({ type: "flush", upTo: this.reqId });
+    for (const p of [...this.pending.values()]) p.resolve(null);
+  }
+
+  dispose() {
+    this.cancelAll();
     if (this.ctx && this.ownsCtx) {
       try {
         this.ctx.close();
       } catch {}
       this.ctx = null;
     }
-  }
-
-  dispose() {
-    this.cancel();
     try {
       this.worker.terminate();
     } catch {}
   }
 }
 
-// One debater's turn. Text pushed in during LLM generation is chunked into
-// sentences and synthesized immediately (in the worker) — so audio is being
-// produced WHILE the LLM is still writing. play() is called later, on cue.
+// One debater's turn. Text pushed during LLM generation is grouped into
+// segments and synthesized right away, so audio is produced WHILE the LLM is
+// still writing. play() can start as soon as the first segment exists.
 class PreparedTurn {
   constructor(backend, voice, label = "turn") {
     this.backend = backend;
     this.voice = voice;
-    this.label = label; // e.g. "Turn 1 (A)" — used to tag console logs
+    this.label = label; // e.g. "Turn 1 (A · The Philosopher)" — tags console logs
     this.ctx = backend._audioCtx();
-    this.buffer = ""; // raw incoming text not yet split into sentences
-    this.segment = ""; // completed sentences accumulating toward one segment
+    this.buffer = ""; // incoming text not yet split into sentences
+    this.segment = ""; // whole sentences accumulating toward one segment
     this.sentences = []; // text of each submitted segment (revealed in play())
-    this.chunks = []; // Promise<{ audio, sampling_rate }> per segment, in order
+    this.chunks = []; // Promise<{ audio, sampling_rate } | null> per segment
     this.sources = new Set();
-    this.timers = []; // pending text-reveal timeouts
-    this.nextTime = 0; // next start time on the audio clock (for gapless play)
+    this.timers = [];
+    this.nextTime = 0; // next start time on the audio clock (gapless play)
+    this.inputDone = false;
     this.canceled = false;
+    this.firstReady = new Promise((r) => (this._firstReadyResolve = r));
+    this._canceledP = new Promise((r) => (this._cancelResolve = r));
+    this._waiter = null; // play() parks here while waiting for the next segment
   }
 
-  // Send one finished segment (one or more sentences) to the worker to synthesize.
+  _notify() {
+    const w = this._waiter;
+    this._waiter = null;
+    w?.();
+  }
+
   _submit(segment) {
     const clean = segment.trim();
     if (!clean || this.canceled) return;
-    const n = this.sentences.push(clean); // segment number (1-based)
+    const n = this.sentences.push(clean);
     log("TTS", `${this.label}: synthesizing seg ${n} (${clean.length} chars)…`);
-    const p = this.backend.synth(clean, this.voice); // synthesis starts now
+    const p = this.backend.synth(clean, this.voice);
     p.then((res) => {
       if (this.canceled) return;
       if (res?.audio) log("TTS", `${this.label}: seg ${n} done in ${res.ms}ms`);
       else log("WARN", `${this.label}: seg ${n} produced no audio (skipped)`);
     });
     this.chunks.push(p);
+    this._firstReadyResolve();
+    this._notify();
   }
 
-  // Accumulate a completed sentence into the current segment; flush to the
-  // worker once the segment is long enough for good prosody.
   _addSentence(sentence) {
     const clean = sentence.trim();
     if (!clean) return;
     this.segment = this.segment ? `${this.segment} ${clean}` : clean;
-    if (this.segment.length >= MIN_SEGMENT_CHARS) {
+    const threshold = this.chunks.length === 0 ? FIRST_SEGMENT_CHARS : MIN_SEGMENT_CHARS;
+    if (this.segment.length >= threshold) {
       this._submit(this.segment);
       this.segment = "";
     }
   }
 
-  // Feed streaming LLM tokens; complete sentences accumulate into segments and
-  // each full segment is synthesized as soon as it's long enough.
   push(delta) {
-    if (this.canceled) return;
+    if (this.canceled || this.inputDone) return;
     this.buffer += delta;
     let match;
     let lastIndex = 0;
@@ -204,61 +222,54 @@ class PreparedTurn {
     if (lastIndex > 0) this.buffer = this.buffer.slice(lastIndex);
   }
 
-  // No more text will arrive — fold any trailing partial sentence into the
-  // pending segment and flush it.
-  finishInput() {
-    if (this.canceled) return;
+  // No more text. `dropTail` (the turn hit the token cap) discards an
+  // unfinished trailing sentence instead of speaking a cut-off fragment.
+  finishInput({ dropTail = false } = {}) {
+    if (this.inputDone) return;
     const tail = this.buffer.trim();
-    if (tail) this.segment = this.segment ? `${this.segment} ${tail}` : tail;
     this.buffer = "";
-    if (this.segment) {
-      this._submit(this.segment);
-      this.segment = "";
-    }
-    log("TTS", `${this.label}: ${this.sentences.length} segment(s) submitted, synthesizing…`);
+    const hasContent = this.chunks.length > 0 || this.segment;
+    if (tail && !(dropTail && hasContent)) this.segment = this.segment ? `${this.segment} ${tail}` : tail;
+    if (this.segment) this._submit(this.segment);
+    this.segment = "";
+    this.inputDone = true;
+    if (!this.canceled) log("TTS", `${this.label}: ${this.sentences.length} segment(s) submitted`);
+    this._firstReadyResolve();
+    this._notify();
   }
 
-  // Resolve once EVERY segment has been synthesized. Call finishInput() first.
-  // A fully-synthesized turn plays perfectly gaplessly (all buffers ready), and
-  // because a turn is prepared during the previous turn's playback, this wait
-  // is hidden for every turn after the first.
-  async ready() {
-    await Promise.allSettled(this.chunks);
-  }
-
-  // Play the (pre)synthesized audio in order, scheduling each segment on the
-  // Web Audio clock so they run back-to-back with NO gaps — even if the main
-  // thread is briefly busy (e.g. generating the next turn). onReveal fires as
-  // each segment actually begins, keeping the transcript in sync with the voice.
+  // Play segments in order on the Web Audio clock (back-to-back, no gaps),
+  // waiting for each one only if it isn't synthesized yet. onReveal fires as
+  // each segment becomes audible, keeping the transcript in sync with the voice.
   async play(onReveal) {
+    if (this.canceled) return;
     this.nextTime = this.ctx.currentTime;
     let shown = "";
     let lastSrc = null;
-    const n = this.chunks.length;
-    log("PLAY", `${this.label}: now speaking (${n} segment(s))`);
+    let i = 0;
+    log("PLAY", `${this.label}: now speaking`);
 
-    for (let i = 0; i < this.chunks.length; i++) {
-      if (this.canceled) return;
-      let res;
-      try {
-        res = await this.chunks[i]; // usually already resolved (synthesized ahead)
-      } catch {
-        res = null;
+    while (!this.canceled) {
+      if (i >= this.chunks.length) {
+        if (this.inputDone) break;
+        await Promise.race([new Promise((r) => (this._waiter = r)), this._canceledP]);
+        continue;
       }
+      const res = await Promise.race([this.chunks[i], this._canceledP.then(() => null)]);
       if (this.canceled) return;
 
       shown = shown ? `${shown} ${this.sentences[i]}` : this.sentences[i];
+      const segNo = i + 1;
+      i++;
       if (res?.audio) {
         const { startAt, src } = this._schedule(res.audio, res.sampling_rate);
         lastSrc = src;
-        // Reveal this segment's text exactly when its audio starts.
         const reveal = shown;
-        const segNo = i + 1;
         const delayMs = Math.max(0, (startAt - this.ctx.currentTime) * 1000);
         this.timers.push(
           setTimeout(() => {
             if (this.canceled) return;
-            log("PLAY", `${this.label}: seg ${segNo}/${n} audible`);
+            log("PLAY", `${this.label}: seg ${segNo} audible`);
             onReveal?.(reveal);
           }, delayMs)
         );
@@ -267,19 +278,23 @@ class PreparedTurn {
       }
     }
 
-    // Resolve only after the last scheduled segment has actually finished.
+    // Resolve once the last scheduled segment has finished — or on cancel, or
+    // after a safety timeout if 'ended' never fires (e.g. iOS interrupts audio).
     if (lastSrc && !this.canceled) {
-      await new Promise((resolve) => {
-        lastSrc.addEventListener("ended", resolve, { once: true });
-        // Guard: if it somehow already ended, don't hang.
-        if (this.ctx.currentTime >= this.nextTime) resolve();
-      });
+      const remainingMs = Math.max(0, (this.nextTime - this.ctx.currentTime) * 1000);
+      await Promise.race([
+        new Promise((resolve) => {
+          lastSrc.addEventListener("ended", resolve, { once: true });
+          if (this.ctx.currentTime >= this.nextTime) resolve();
+        }),
+        new Promise((resolve) => setTimeout(resolve, remainingMs + 3000)),
+        this._canceledP,
+      ]);
     }
     if (!this.canceled) log("PLAY", `${this.label}: finished speaking`);
   }
 
-  // Queue one segment to start the moment the previous one ends (or now, if we
-  // fell behind). Returns immediately — playback happens on the audio thread.
+  // Queue one segment to start the moment the previous one ends.
   _schedule(float32, sampleRate) {
     const ctx = this.ctx;
     const buf = ctx.createBuffer(1, float32.length, sampleRate);
@@ -296,7 +311,11 @@ class PreparedTurn {
   }
 
   cancel() {
+    if (this.canceled) return;
     this.canceled = true;
+    this._cancelResolve();
+    this._firstReadyResolve();
+    this._notify();
     for (const t of this.timers) clearTimeout(t);
     this.timers = [];
     for (const src of this.sources) {

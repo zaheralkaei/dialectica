@@ -19,14 +19,14 @@ export const VOICES = [
   { id: "en_US-libritts_r-medium", label: "Miles (US male, expressive)", hint: { lang: "en-US", gender: "male" } },
 ];
 
-// Resolve the voice field for a given engine. Piper wants the ID string; Web
-// Speech wants either a specific system voiceURI (character.webVoice, if the
-// user picked one) or the { lang, gender } hint derived from the Piper voice id.
+// Resolve the voice preference for a given engine. Piper wants the voice ID;
+// Web Speech gets { uri, hint }: the specific system voice to try first (the
+// user's pick or the preset's, e.g. "Google UK English Male"), and a
+// { lang, gender } hint used when that voice doesn't exist in this browser.
 export function voiceForEngine(character, engine) {
   if (engine === "webspeech") {
-    if (character.webVoice) return character.webVoice; // user-picked system voice
     const v = VOICES.find((x) => x.id === character.voice);
-    return v?.hint || { lang: "en", gender: undefined };
+    return { uri: character.webVoice || null, hint: v?.hint || { lang: "en" } };
   }
   return character.voice; // piper
 }

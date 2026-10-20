@@ -16,18 +16,30 @@
   box-sizing: border-box;
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 body {
   margin: 0;
   background: radial-gradient(1200px 600px at 50% -10%, #20243d 0%, var(--bg) 60%);
+  background-color: var(--bg);
   color: var(--text);
   font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
   min-height: 100vh;
+  min-height: 100dvh;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .app {
   max-width: 1000px;
   margin: 0 auto;
   padding: 28px 20px 80px;
+}
+/* Leave room for the fixed Stop dock while a debate runs. */
+.app.busy {
+  padding-bottom: calc(110px + env(safe-area-inset-bottom));
 }
 
 .hero {
@@ -93,10 +105,15 @@ body {
 /* Stage */
 .stage {
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  /* minmax(0, …): grid items default to min-width:auto, so a long name would
+     refuse to shrink and push the page wider than a phone screen. */
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   gap: 16px;
   align-items: stretch;
   margin-bottom: 20px;
+}
+.stage > * {
+  min-width: 0;
 }
 .vs {
   align-self: center;
@@ -164,6 +181,33 @@ body {
 .live-dot {
   color: var(--accent);
   animation: pulse 1s infinite;
+}
+
+/* Compact cards while debating: just who's who, so the transcript is visible. */
+.debater.compact {
+  padding: 10px 12px;
+}
+.debater.compact .debater-head {
+  margin-bottom: 0;
+  gap: 10px;
+}
+.debater.compact .avatar {
+  font-size: 1.4rem;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+.name-text,
+.debater.compact .side-label {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.name-text {
+  font-weight: 700;
+  font-size: 1rem;
 }
 
 /* Fields */
@@ -243,8 +287,24 @@ select:disabled {
 }
 .actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 16px;
+}
+.topic-now > span {
+  display: block;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.topic-now > p {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 button {
@@ -303,6 +363,59 @@ button:disabled {
   background: linear-gradient(90deg, var(--primary-2), var(--primary));
   transition: width 0.3s;
 }
+.voice-status {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.8rem;
+}
+
+/* Stop dock: always reachable while a debate runs, however long the
+   transcript gets (it used to scroll off-screen, especially on phones). */
+.dock {
+  position: fixed;
+  left: 50%;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  width: min(560px, calc(100% - 24px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 14px;
+  background: rgba(29, 33, 53, 0.92);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 10px 30px -8px rgba(0, 0, 0, 0.6);
+  z-index: 900;
+}
+.dock-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.dock-dot.live {
+  background: var(--danger);
+  animation: pulse 1s infinite;
+}
+.dock-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.88rem;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dock .danger {
+  flex: 0 0 auto;
+  padding: 10px 18px;
+}
+.transcript-end {
+  scroll-margin-bottom: calc(100px + env(safe-area-inset-bottom));
+}
 
 /* Transcript */
 .transcript {
@@ -343,6 +456,10 @@ button:disabled {
   font-weight: 700;
   font-size: 0.85rem;
   color: var(--accent);
+}
+.bubble-text,
+.topic-now > p {
+  overflow-wrap: anywhere; /* a long unbroken word must not widen the page */
 }
 .bubble-text {
   line-height: 1.55;
@@ -494,16 +611,79 @@ button:disabled {
 }
 
 @media (max-width: 760px) {
+  .app {
+    padding: 18px 14px 60px;
+  }
+  .hero {
+    margin-bottom: 16px;
+  }
+  .hero h1 {
+    font-size: 2rem;
+  }
+  .tagline {
+    font-size: 0.92rem;
+  }
   .stage {
     grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  /* While debating, keep both compact cards side by side. */
+  .stage.compact {
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    gap: 8px;
+  }
+  .stage.compact .vs {
+    font-size: 0.8rem;
+  }
+  .stage.compact .debater.compact {
+    padding: 8px 9px;
+  }
+  .stage.compact .avatar {
+    width: 32px;
+    height: 32px;
+    font-size: 1.15rem;
+  }
+  .stage.compact .side-label {
+    font-size: 0.62rem;
+  }
+  .stage.compact .name-text {
+    font-size: 0.86rem;
   }
   .vs {
     justify-self: center;
   }
+  .controls {
+    padding: 14px;
+  }
   .settings {
     grid-template-columns: 1fr;
   }
+  /* iOS zooms the page when focusing an input whose text is under 16px. */
+  input[type="text"],
+  textarea,
+  select {
+    font-size: 16px;
+  }
+  .actions > button {
+    flex: 1 1 auto;
+  }
   .bubble {
     max-width: 92%;
+  }
+  .modal {
+    padding: 22px 18px;
+    max-height: 85vh;
+    max-height: 85dvh;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

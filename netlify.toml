@@ -9,12 +9,18 @@
   status = 200
 
 # Cross-origin isolation → SharedArrayBuffer → multi-threaded onnxruntime WASM,
-# which keeps Kokoro synthesis fast on the CPU (2–4× vs single-thread) while
-# leaving the GPU entirely to WebLLM (running Kokoro on WebGPU exhausts VRAM and
-# crashes the LLM). COEP "credentialless" keeps WebLLM's cross-origin model
-# downloads from the Hugging Face CDN working (unlike "require-corp").
+# which keeps CPU-side inference (Piper voices, the Lite CPU model) fast while
+# leaving the GPU to WebLLM. COEP "credentialless" keeps the cross-origin model
+# downloads from Hugging Face and the CDNs working (unlike "require-corp").
 [[headers]]
   for = "/*"
   [headers.values]
     Cross-Origin-Opener-Policy = "same-origin"
     Cross-Origin-Embedder-Policy = "credentialless"
+
+# Vite fingerprints every file in /assets, so they can be cached forever: repeat
+# visits load the app's JS (several MB) straight from the browser cache.
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

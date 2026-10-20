@@ -13,6 +13,7 @@ export default function DebaterCard({
   webVoices,
   active,
   disabled,
+  compact = false,
 }) {
   const applyPreset = (id) => {
     const preset = presets.find((p) => p.id === id);
@@ -41,6 +42,25 @@ export default function DebaterCard({
     }
   };
 
+  // During a debate the setup fields are locked anyway — show a compact card so
+  // the transcript (what you actually want to see) is on screen, especially on phones.
+  if (compact) {
+    return (
+      <div className={`debater compact ${active ? "speaking" : ""}`} style={{ "--accent": character.color }}>
+        <div className="debater-head">
+          <span className="avatar" aria-hidden>
+            {character.emoji}
+          </span>
+          <div className="debater-meta">
+            <span className="side-label">{label}</span>
+            <span className="name-text">{character.name}</span>
+          </div>
+          {active && <span className="live-dot" title="Speaking">●</span>}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`debater ${active ? "speaking" : ""}`}
@@ -58,6 +78,7 @@ export default function DebaterCard({
             className="name-input"
             value={character.name}
             disabled={disabled}
+            aria-label={`Debater ${side} name`}
             onChange={(e) => set({ name: e.target.value })}
           />
         </div>

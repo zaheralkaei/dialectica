@@ -4,10 +4,12 @@
 // cross-origin isolation headers we set — see vite.config.js / netlify.toml).
 //
 // Protocol (main <-> worker):
-//   main -> { type:'load', voices:string[] }   pre-download + warm up
+//   main -> { type:'load', voices:string[] }   download missing voices + warm up (once)
 //   worker -> { type:'progress', p } | { type:'ready' } | { type:'error', error }
 //   main -> { type:'gen', id, text, voice }
+//   worker -> { type:'start', id }   (job began — the main thread starts its timeout now)
 //   worker -> { type:'audio', id, audio:Float32Array, sampling_rate, ms } | { ...error }
+//   main -> { type:'flush', upTo }   drop queued jobs with id <= upTo (debate stopped)
 
 import * as piper from "@diffusionstudio/vits-web";
 
@@ -15,6 +17,10 @@ import * as piper from "@diffusionstudio/vits-web";
 // overlapping calls just contend. One synth at a time, each returning as soon as
 // it finishes so segment 1 never waits behind segment 2.
 let genChain = Promise.resolve();
+// Jobs at or below this id belong to a stopped debate and are skipped.
+let flushUpTo = 0;
+// The first predict() initialises onnxruntime + the phonemizer; only pay that once.
+let warmed = false;
 
 // Normalize text before synthesis. The espeak phonemizer can emit a phoneme id
 // outside the model's range for some non-ASCII punctuation (smart quotes, em
@@ -61,12 +67,20 @@ function wavToFloat32(buf) {
 self.onmessage = async (e) => {
   const msg = e.data;
 
+  if (msg.type === "flush") {
+    flushUpTo = Math.max(flushUpTo, msg.upTo || 0);
+    return;
+  }
+
   if (msg.type === "load") {
     try {
-      const voices = (msg.voices || []).filter(Boolean);
-      // Pre-download the debater voices (cached in OPFS) so the debate doesn't
-      // stall mid-turn fetching a model.
+      const voices = [...new Set((msg.voices || []).filter(Boolean))];
+      // Download only voices that aren't cached in OPFS yet. vits-web's
+      // download() always refetches, which used to re-download ~60 MB per voice
+      // on every Start.
+      const stored = new Set(await piper.stored().catch(() => []));
       for (const voiceId of voices) {
+        if (stored.has(voiceId)) continue;
         await piper.download(voiceId, (p) =>
           self.postMessage({
             type: "progress",
@@ -80,7 +94,10 @@ self.onmessage = async (e) => {
       }
       // Warm up: the first predict also fetches + inits onnxruntime and the
       // phonemizer WASM from their CDNs, so pay that off the critical path.
-      if (voices[0]) await piper.predict({ text: "Ready.", voiceId: voices[0] });
+      if (!warmed && voices[0]) {
+        await piper.predict({ text: "Ready.", voiceId: voices[0] });
+        warmed = true;
+      }
       self.postMessage({ type: "ready" });
     } catch (err) {
       self.postMessage({ type: "error", error: String(err?.message || err) });
@@ -90,6 +107,8 @@ self.onmessage = async (e) => {
 
   if (msg.type === "gen") {
     genChain = genChain.then(async () => {
+      if (msg.id <= flushUpTo) return; // stopped before it started; main already moved on
+      self.postMessage({ type: "start", id: msg.id });
       const t0 = performance.now();
       try {
         const text = cleanText(msg.text) || msg.text;
