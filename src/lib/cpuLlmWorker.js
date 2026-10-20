@@ -15,6 +15,41 @@ const MODEL = "onnx-community/Qwen2.5-0.5B-Instruct";
 
 env.allowLocalModels = false;
 
+// Cache model files in the Origin Private File System instead of Cache Storage.
+// Chromium refuses to store a single ~500 MB response in Cache Storage
+// ("Failed to execute 'put' on 'Cache': Unexpected internal error"), so the
+// model was silently re-downloaded on every visit. OPFS handles large files and
+// writes them as a stream. createWritable() writes to a swap file that is only
+// committed when the stream closes, so an interrupted download never leaves a
+// truncated model behind. Where OPFS writing isn't supported, put() fails and
+// transformers.js just logs a warning and carries on without a cache.
+async function opfsFile(key, create) {
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle("transformers-cache", { create: true });
+  const name = String(key).replace(/^https?:\/\//, "").replace(/[^\w.-]/g, "_").slice(-200);
+  return dir.getFileHandle(name, { create });
+}
+const opfsCache = {
+  async match(key) {
+    try {
+      const file = await (await opfsFile(key, false)).getFile();
+      if (!file.size) return undefined; // left empty by an interrupted write
+      return new Response(file, { headers: { "content-length": String(file.size) } });
+    } catch {
+      return undefined;
+    }
+  },
+  async put(key, response) {
+    const writable = await (await opfsFile(key, true)).createWritable();
+    await response.body.pipeTo(writable); // closes (commits) on success, aborts on error
+  },
+};
+if (navigator.storage?.getDirectory) {
+  env.useBrowserCache = false;
+  env.useCustomCache = true;
+  env.customCache = opfsCache;
+}
+
 let generator = null;
 const stopping = new InterruptableStoppingCriteria();
 let cancelUpTo = 0;
@@ -35,7 +70,11 @@ self.onmessage = (e) => {
 async function load() {
   try {
     generator = await pipeline("text-generation", MODEL, {
-      dtype: "q4",
+      // 8-bit, not 4-bit: for this repo the q4 file is actually the LARGER
+      // download (786 MB vs 512 MB — it keeps full-precision embeddings), and
+      // 4-bit visibly degrades a 0.5B model (it drifted into chatbot filler
+      // instead of debating). 8-bit stays close to the original model.
+      dtype: "q8",
       device: "wasm",
       progress_callback: (p) => self.postMessage({ type: "progress", p }),
     });

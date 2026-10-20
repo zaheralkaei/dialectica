@@ -16,6 +16,25 @@ const LABEL_WORDS = ["opening statement", "closing statement", "opening", "closi
 const ACTION_RE =
   /^(?:\w+ly\s+)?(?:laugh|chuckle|smile|sigh|pause|lean|nod|shrug|gesture|scoff|grin|smirk|frown|wink|whisper|shout|clear|raise|point|tap|shake|stand|sit|turn|look|glance|cross|slam|spread|lower|applause|dramatic|beat|silence)/i;
 
+// Chatbot filler some models open a turn with instead of arguing:
+// "Hello, The Philosopher!", "Dear viewers,", "Sure, here goes:",
+// "Here's my rebuttal:", "Thanks for the prompt." Only ever stripped from the
+// very start of a turn, and only when followed by punctuation, so a "Sure"
+// or "Hi" mid-argument (or "History shows…") is left alone.
+const PREAMBLE_RE = new RegExp(
+  "^\\s*(?:" +
+    [
+      "(?:hello|hi|hey|greetings)\\b(?:\\s+(?:again|there|everyone|all|viewers|folks|friends))?(?:,?\\s+(?:the\\s+)?[a-z][\\w ]{0,30}?)?",
+      "dear\\s+[a-z][\\w ]{0,30}?",
+      "good\\s+(?:morning|afternoon|evening)\\b(?:,?\\s+[\\w ]{0,30}?)?",
+      "(?:sure|certainly|of course|absolutely|okay|ok)\\b(?:,?\\s+here(?:'s|’s| is| goes)[^.!?:]{0,40})?",
+      "here(?:'s|’s| is) my (?:response|rebuttal|reply|turn|opening statement|closing statement|argument)\\b",
+      "thanks?(?: you)?(?: (?:so|very) much)? for (?:the|this|your) (?:prompt|question|opportunity|invitation)\\b[^.!?]{0,40}",
+    ].join("|") +
+    ")\\s*[.!?,:;—–-]+\\s*",
+  "i"
+);
+
 // Characters held at the start of each line until we know it isn't "Name:".
 const HOLD = 48;
 // A *span* or (span) longer than this was never a stage direction.
@@ -116,6 +135,24 @@ export function createSpeechFilter({ names = [] } = {}) {
     text = text.replace(labelRe, "");
     // Models often wrap their whole reply in quotes; drop the opening one.
     if (lineIndex === 0) text = text.replace(/^\s*["“”]\s*/, "");
+    if (!text.trim()) {
+      lineStart = true; // it was only a label — keep holding what follows it
+      return;
+    }
+    if (lineIndex === 0 && tail === "") {
+      // Strip opening filler — possibly several in a row ("Hi! Thanks for the prompt.").
+      let stripped = false;
+      for (let k = 0; k < 3; k++) {
+        const m = text.match(PREAMBLE_RE);
+        if (!m) break;
+        text = text.slice(m[0].length);
+        stripped = true;
+      }
+      if (stripped && !text.trim()) {
+        lineStart = true; // everything so far was filler — keep holding and check again
+        return;
+      }
+    }
     for (const c of text) emit(c);
   }
 

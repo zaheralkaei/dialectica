@@ -18,7 +18,9 @@ export async function createCpuEngine(onProgress) {
         total += f.total;
       }
       const frac = total ? loaded / total : 0;
-      onProgress?.({ progress: frac, text: `Downloading Lite CPU model… ${Math.round(frac * 100)}%` });
+      // "Loading", not "Downloading": progress is also reported when the model
+      // is read back from the on-device cache.
+      onProgress?.({ progress: frac, text: `Loading Lite CPU model… ${Math.round(frac * 100)}%` });
     } else if (p?.status === "ready") {
       onProgress?.({ progress: 1, text: "Starting Lite CPU model…" });
     }

@@ -265,13 +265,16 @@ export default function App() {
     }
     unlockAudio();
     if (ttsEngine === "webspeech") unlockSpeech();
+    // Ask the browser not to evict our cached models under storage pressure
+    // (otherwise a multi-GB model can silently vanish and be re-downloaded).
+    navigator.storage?.persist?.().catch(() => {});
 
     const prev = runRef.current;
     const run = createRun();
     runRef.current = run;
     if (resume) {
       // Pick up right after the last turn that was actually heard.
-      const heard = committedRef.current.filter((r) => r.heard);
+      const heard = committedRef.current.filter((r) => r.heard && r.text);
       committedRef.current = heard;
       nextTurnRef.current = heard.length ? heard[heard.length - 1].turn + 1 : 0;
     } else {
@@ -513,9 +516,17 @@ export default function App() {
       // `heard` flips on the first revealed sentence. Continue resumes after the
       // last turn the user actually heard — not one that was generated but cut
       // off by Stop before a word of it played.
-      const record = { turn, speaker: cur.speaker, speakerName: cur.character.name, text: "", heard: false };
+      // Recorded right away (not when generation finishes): playback starts
+      // before the turn is fully written, so a Stop can land on a turn that is
+      // partly heard but still generating. Its text tracks what has been heard
+      // until the full text is known, so Continue never repeats a turn that is
+      // already on screen.
+      const record = { turn, speaker: cur.speaker, speakerName: cur.character.name, text: "", heard: false, done: false };
+      committedRef.current.push(record);
+      if (committedRef.current.length > 12) committedRef.current.splice(0, committedRef.current.length - 12);
       const playing = cur.prep.play((t) => {
         record.heard = true;
+        if (!record.done) record.text = t;
         updateEntry(entryId, t);
       });
 
@@ -525,9 +536,9 @@ export default function App() {
       if (text) {
         emptyStreak = 0;
         record.text = text;
-        committedRef.current.push(record);
-        if (committedRef.current.length > 12) committedRef.current.splice(0, committedRef.current.length - 12);
+        record.done = true;
       } else {
+        committedRef.current = committedRef.current.filter((r) => r !== record);
         setTranscript((t) => t.filter((e) => e.id !== entryId));
         log("WARN", `Turn ${turn + 1}: the model produced no usable text — skipping`);
         if (++emptyStreak >= 3) throw new Error("The model produced no usable text three times in a row. Try another model.");
@@ -552,7 +563,7 @@ export default function App() {
     dropEmptyEntries();
     setActiveSpeaker(null);
     setStatus(
-      committedRef.current.some((r) => r.heard) ? "Stopped. Press Continue to pick up where it left off." : "Stopped."
+      committedRef.current.some((r) => r.heard && r.text) ? "Stopped. Press Continue to pick up where it left off." : "Stopped."
     );
     setVoiceStatus("");
     setPhase(PHASES.DONE);
